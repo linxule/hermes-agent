@@ -162,6 +162,11 @@ _CHAT_MESSAGE_INCOMPLETE_STATUSES = {
     "STATUS_UNSPECIFIED",
     "STATUS_GENERATING",
 }
+# NOTE: `role` classifies message CONTENT (USER/ASSISTANT/SYSTEM per OpenAI chat
+# semantics), not sender IDENTITY. A human using AI-drafting tools may emit
+# `role=ASSISTANT`; a bot may emit `role=USER`. Use `group_trusted_senders` for
+# authoritative sender-identity gating; this role axis is a best-effort content
+# signal only.
 _USER_MESSAGE_ROLES = {"USER", "ROLE_USER", "MESSAGE_ROLE_USER"}
 _NON_USER_MESSAGE_ROLES = {
     "ASSISTANT",
@@ -805,6 +810,26 @@ class KimiAdapter(BasePlatformAdapter):
         self._group_require_mention: bool = bool(
             config.extra.get("group_require_mention", False)
         )
+
+        # Short_id / id allowlist — authoritative identity-based bypass of role filter
+        trusted = config.extra.get("group_trusted_senders") or []
+        self._group_trusted_senders: frozenset[str] = frozenset(
+            str(s) for s in trusted if isinstance(s, (str, int))
+        )
+
+        # Policy for non-user-role senders: "off" | "trusted_only" | "mentions" | "all"
+        raw = config.extra.get("group_allow_bot_senders", "off")
+        if raw is True:
+            raw = "all"
+        elif raw is False:
+            raw = "off"
+        if raw not in ("off", "trusted_only", "mentions", "all"):
+            logger.warning(
+                "Kimi: invalid group_allow_bot_senders=%r, defaulting to 'off'", raw
+            )
+            raw = "off"
+        self._group_allow_bot_senders: str = raw
+
         self._hydrate_missing_text: bool = bool(
             config.extra.get("hydrate_missing_text", True)
         )
@@ -1708,6 +1733,36 @@ class KimiAdapter(BasePlatformAdapter):
             logger.exception("Kimi groups: unexpected error in Subscribe")
             return 0
 
+    def _is_mention_of_me(self, msg: Dict[str, Any]) -> bool:
+        """Check whether a ChatMessage event explicitly @-mentions this bot.
+
+        Reads the `mentions` array and `mentioned` field, matching against
+        self._me_id and self._me_short_id. Pure function — no side effects.
+
+        NOTE: `group_allow_bot_senders="mentions"` is EXPERIMENTAL. Kimi's
+        mention metadata may be client-provided rather than server-enriched
+        (unverified as of this commit). Until verified via probe, a malicious
+        sender could spoof mentions to bypass this gate. For production
+        authorization, prefer `trusted_only` with an explicit
+        `group_trusted_senders` allowlist.
+        """
+        if bool(_field(msg, "mentioned")):
+            return True
+        mentions = msg.get("mentions") or []
+        if not isinstance(mentions, list):
+            return False
+        for m in mentions:
+            if not isinstance(m, dict):
+                continue
+            for key in ("short_id", "shortId"):
+                v = m.get(key)
+                if v and self._me_short_id and str(v) == self._me_short_id:
+                    return True
+            v = m.get("id")
+            if v and self._me_id and str(v) == self._me_id:
+                return True
+        return False
+
     async def _on_group_event(self, event: Dict[str, Any]) -> None:
         """Handle one decoded envelope from the Subscribe firehose.
 
@@ -1741,11 +1796,11 @@ class KimiAdapter(BasePlatformAdapter):
             logger.debug("Kimi groups: ignoring %s event", case)
             return
         if case != "chatMessage" or not msg:
-            logger.debug("Kimi groups: unsupported event shape, skipping: %.200r", event)
+            logger.info("Kimi groups: unsupported event shape, skipping: %.200r", event)
             return
 
         if not _chat_message_is_complete(_field(msg, "status")):
-            logger.debug(
+            logger.info(
                 "Kimi groups: skipping incomplete chatMessage status=%r",
                 _field(msg, "status"),
             )
@@ -1754,7 +1809,7 @@ class KimiAdapter(BasePlatformAdapter):
         chat_id = _field(msg, "chatId", "chat_id")
         message_id = _field(msg, "messageId", "message_id")
         if not (chat_id and message_id):
-            logger.debug("Kimi groups: event missing chat_id/message_id, skipping: %.200r", msg)
+            logger.info("Kimi groups: event missing chat_id/message_id, skipping: %.200r", msg)
             return
 
         sender = msg.get("sender") or {}
@@ -1781,7 +1836,7 @@ class KimiAdapter(BasePlatformAdapter):
         if sent_at:
             event_ts = _parse_iso8601(sent_at)
             if event_ts and event_ts < (self._startup_ts - self._startup_grace_s):
-                logger.debug(
+                logger.info(
                     "Kimi groups: skipping stale event %s (sent_at=%s)",
                     message_id,
                     sent_at,
@@ -1834,14 +1889,40 @@ class KimiAdapter(BasePlatformAdapter):
             return
         if sender_short_id and self._me_short_id and sender_short_id == self._me_short_id:
             return
-        if not _chat_message_is_user_role(message_role):
-            logger.debug(
-                "Kimi groups: skipping non-user message %s/%s role=%r",
-                chat_id,
-                message_id,
-                message_role,
-            )
-            return
+
+        # Trusted-sender allowlist — authoritative bypass of role filter
+        is_trusted = False
+        if sender_short_id and sender_short_id in self._group_trusted_senders:
+            is_trusted = True
+        elif sender_id and sender_id in self._group_trusted_senders:
+            is_trusted = True
+
+        # Role filter — gated by allow_bot_senders policy
+        if not is_trusted and not _chat_message_is_user_role(message_role):
+            policy = self._group_allow_bot_senders
+            if policy == "off":
+                logger.info(
+                    "Kimi groups: dropping non-user message %s/%s role=%r (group_allow_bot_senders=off)",
+                    chat_id, message_id, message_role,
+                )
+                return
+            elif policy == "trusted_only":
+                logger.info(
+                    "Kimi groups: dropping non-user message %s/%s role=%r sender=%r (not in group_trusted_senders)",
+                    chat_id, message_id, message_role,
+                    sender_short_id or sender_id,
+                )
+                return
+            elif policy == "mentions":
+                if not self._is_mention_of_me(msg):
+                    logger.info(
+                        "Kimi groups: dropping non-user message %s/%s role=%r (group_allow_bot_senders=mentions, no @mention of us)",
+                        chat_id, message_id, message_role,
+                    )
+                    return
+                # falls through
+            elif policy == "all":
+                pass  # falls through
 
         if not text and not media_urls:
             logger.debug(
@@ -1880,17 +1961,13 @@ class KimiAdapter(BasePlatformAdapter):
 
         # Mention gate: if configured to require mentions and the message
         # doesn't reference us, ignore. Supports both numeric id and short_id.
-        mentions = msg.get("mentions") or []
-        if self._group_require_mention:
-            mentioned_us = bool(_field(msg, "mentioned"))
-            for m in mentions if isinstance(mentions, list) else []:
-                mid = m.get("id") if isinstance(m, dict) else m
-                if mid in (self._me_id, self._me_short_id):
-                    mentioned_us = True
-                    break
-            if not mentioned_us:
-                logger.debug("Kimi groups: ignoring non-mention in room %s", chat_id)
-                return
+        if self._group_require_mention and not self._is_mention_of_me(msg):
+            logger.info(
+                "Kimi groups: dropping message %s/%s (group_require_mention=true, no @mention of us)",
+                chat_id,
+                message_id,
+            )
+            return
 
         chat_id_prefixed = f"{_CHATID_ROOM_PREFIX}{chat_id}"
 

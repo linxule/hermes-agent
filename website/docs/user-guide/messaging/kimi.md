@@ -54,6 +54,16 @@ platforms:
       # Behaviour tuning
       user_message_prefix: "User Message From Kimi:\n"
       group_require_mention: false        # If true, only respond when @-mentioned
+      # Sender-identity allowlist — bypasses the role-content filter for these
+      # senders. Accepts short_ids (e.g. "u_bot") and/or Kimi user ids.
+      # group_trusted_senders:
+      #   - u_conductor
+      # Policy for non-user-role senders (assistants, bots, systems):
+      #   "off"           — drop all non-user-role messages (default; matches pre-existing behavior)
+      #   "trusted_only"  — dispatch only if sender is in group_trusted_senders
+      #   "mentions"      — dispatch only if sender @-mentions us (EXPERIMENTAL — see Authorization model)
+      #   "all"           — dispatch all non-user-role messages (treat identically to USER role)
+      # group_allow_bot_senders: off
       # Reconnect tuning
       ws_ping_interval: 15
       ws_ping_timeout: 60
@@ -69,6 +79,35 @@ platforms:
         - id: "kimi-claw"
           version: "0.25.0"
 ```
+
+### Authorization model
+
+Kimi authorization runs in two layers. The first gates the **user identity** (can this user talk to the bot at all); the second gates the **message content** (within an authorized room, which messages get dispatched to the agent).
+
+**User allowlist (env vars, existing):**
+
+- `KIMI_ALLOWED_USERS` — DM + group user allowlist (comma-separated user ids / short ids / `kimi:<id>` forms).
+- `KIMI_GROUP_ALLOWED_USERS` — additional allowlist scoped to group rooms; accepts raw chat-uuids or prefixed `room:<uuid>`.
+- `KIMI_ALLOW_ALL_USERS=true` — skips the allowlist entirely. Appropriate only for a personal one-user bot.
+
+These run identically to Telegram/Discord authorization — unauthorized users are rejected before any adapter-specific processing.
+
+**Sender / role policy (adapter extras, new):**
+
+Within an authorized room, group events go through a role-based content filter: messages classified as `USER` role are dispatched, and `ASSISTANT` / `BOT` / `SYSTEM` messages default to silent drops. Two extras relax this gate for legitimate non-user-role senders (orchestrator bots, conductor personas, AI-drafted human messages):
+
+- `group_trusted_senders` — a list of short_ids and/or Kimi user ids. Any sender in this list bypasses the role-content filter. This is the authoritative sender-identity gate — use it whenever you know the concrete identity of a bot you want to hear from.
+- `group_allow_bot_senders` — policy for non-user-role senders that aren't in `group_trusted_senders`:
+  - `"off"` (default) — drop all non-user-role messages. Matches pre-existing behavior.
+  - `"trusted_only"` — drop unless sender is in `group_trusted_senders` (drops silently, logs at INFO).
+  - `"mentions"` — dispatch only if the message @-mentions this bot. **EXPERIMENTAL.** Kimi's mention metadata may be client-provided rather than server-enriched (unverified as of this commit). Until the spoofability probe runs, a malicious sender could forge `mentions: [{short_id: <us>}]` to bypass this gate. For production authorization of bot senders, prefer `trusted_only` with an explicit allowlist. `"mentions"` is most useful on short-lived experimental deployments where the participant set is already controlled out-of-band.
+  - `"all"` — dispatch every non-user-role message (treat identically to `USER` role). Equivalent to disabling the role filter entirely for bot senders.
+
+Self-filter (drop messages this bot sent itself) still runs before either gate, so enabling any of these does NOT cause the bot to loop on its own replies.
+
+Filter decisions that drop a message now log at **INFO** level, so operators can see gate behavior in normal logs without dialing up to DEBUG. Raw event dumps, keepalive pings, and content-shape diagnostics remain at DEBUG.
+
+**Role-as-content vs sender-as-identity.** The `role` field classifies message CONTENT (USER/ASSISTANT/SYSTEM per OpenAI chat semantics), not sender IDENTITY. A human using AI-drafting tools can emit `role=ASSISTANT`, and a bot can emit `role=USER`. Use `group_trusted_senders` for authoritative gating; treat `role` as a best-effort content signal only.
 
 ## Chat-id format
 

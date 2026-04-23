@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import struct
 import unittest
@@ -711,6 +712,240 @@ class GroupRpcHelperTests(unittest.IsolatedAsyncioTestCase):
         })
 
         adapter.handle_message.assert_not_awaited()
+
+
+def _bot_msg(**overrides) -> dict:
+    """Build a minimal ROLE_ASSISTANT chatMessage event with a bot-role sender."""
+    base = {
+        "chatMessage": {
+            "chatId": "chat-bot",
+            "messageId": "msg-bot",
+            "status": "STATUS_COMPLETED",
+            "role": "ROLE_ASSISTANT",
+            "senderId": "assistant-1",
+            "senderShortId": "u_bot",
+            "summary": "hello from bot",
+        },
+    }
+    base["chatMessage"].update(overrides)
+    return base
+
+
+class GroupTrustedSenderTests(unittest.IsolatedAsyncioTestCase):
+    """group_trusted_senders is an authoritative short_id / id allowlist."""
+
+    async def test_group_trusted_sender_bypasses_role_filter(self):
+        adapter = KimiAdapter(_cfg(group_trusted_senders=["u_bot"]))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_group_trusted_sender_by_id_also_matches(self):
+        adapter = KimiAdapter(_cfg(group_trusted_senders=["assistant-1"]))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        # senderShortId not in allowlist; senderId IS — should still bypass.
+        await adapter._on_group_event(_bot_msg(senderShortId="u_somebody_else"))
+
+        adapter.handle_message.assert_awaited_once()
+
+
+class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """group_allow_bot_senders policy: off | trusted_only | mentions | all."""
+
+    async def test_group_allow_bot_senders_off_drops_assistant(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="off"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_group_allow_bot_senders_trusted_only_drops_untrusted_assistant(self):
+        adapter = KimiAdapter(_cfg(
+            group_allow_bot_senders="trusted_only",
+            group_trusted_senders=["u_other"],
+        ))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_group_allow_bot_senders_trusted_only_allows_trusted_assistant(self):
+        adapter = KimiAdapter(_cfg(
+            group_allow_bot_senders="trusted_only",
+            group_trusted_senders=["u_bot"],
+        ))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_group_allow_bot_senders_mentions_allows_with_mention(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="mentions"))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg(
+            mentions=[{"short_id": "u_me"}],
+        ))
+
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_group_allow_bot_senders_mentions_drops_without_mention(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="mentions"))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg(
+            mentions=[{"short_id": "u_someone_else"}],
+        ))
+
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_group_allow_bot_senders_all_allows_unconditionally(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_awaited_once()
+
+
+class IsMentionOfMeTests(unittest.TestCase):
+    """_is_mention_of_me: pure helper shared by policy + group_require_mention."""
+
+    def _adapter(self) -> KimiAdapter:
+        adapter = KimiAdapter(_cfg())
+        adapter._me_id = "bot-self-id"
+        adapter._me_short_id = "u_me"
+        return adapter
+
+    def test_is_mention_of_me_short_id_match(self):
+        adapter = self._adapter()
+        self.assertTrue(adapter._is_mention_of_me({
+            "mentions": [{"short_id": "u_me"}],
+        }))
+        # shortId variant
+        self.assertTrue(adapter._is_mention_of_me({
+            "mentions": [{"shortId": "u_me"}],
+        }))
+
+    def test_is_mention_of_me_id_match(self):
+        adapter = self._adapter()
+        self.assertTrue(adapter._is_mention_of_me({
+            "mentions": [{"id": "bot-self-id"}],
+        }))
+
+    def test_is_mention_of_me_mentioned_flag_fallback(self):
+        adapter = self._adapter()
+        # No mentions array, but `mentioned: true` → accept
+        self.assertTrue(adapter._is_mention_of_me({"mentioned": True}))
+
+    def test_is_mention_of_me_no_match(self):
+        adapter = self._adapter()
+        self.assertFalse(adapter._is_mention_of_me({}))
+        self.assertFalse(adapter._is_mention_of_me({
+            "mentions": [{"short_id": "u_someone_else"}],
+        }))
+        # Malformed inputs return False
+        self.assertFalse(adapter._is_mention_of_me({"mentions": "not-a-list"}))
+        self.assertFalse(adapter._is_mention_of_me({"mentions": ["not-a-dict"]}))
+
+
+class GroupPolicyLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """Policy drops log at INFO, not DEBUG, for operator observability."""
+
+    async def test_policy_drops_log_at_info_level(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="off"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.INFO) as cm:
+            await adapter._on_group_event(_bot_msg())
+
+        adapter.handle_message.assert_not_awaited()
+        # Exactly one INFO record, and it's the policy-drop message.
+        info_records = [r for r in cm.records if r.levelno == logging.INFO]
+        self.assertTrue(
+            any("group_allow_bot_senders=off" in r.getMessage() for r in info_records),
+            f"expected INFO drop log, got: {[r.getMessage() for r in cm.records]}",
+        )
+
+
+class GroupInvalidPolicyTests(unittest.TestCase):
+    """Invalid group_allow_bot_senders values log WARNING and fall back to 'off'."""
+
+    def test_invalid_bot_sender_policy_defaults_to_off(self):
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING) as cm:
+            adapter = KimiAdapter(_cfg(group_allow_bot_senders="nonsense"))
+        self.assertEqual(adapter._group_allow_bot_senders, "off")
+        self.assertTrue(
+            any(
+                "invalid group_allow_bot_senders" in r.getMessage()
+                and r.levelno == logging.WARNING
+                for r in cm.records
+            ),
+            f"expected WARNING about invalid policy, got: {[r.getMessage() for r in cm.records]}",
+        )
+
+
+class GroupRequireMentionSharedHelperTests(unittest.IsolatedAsyncioTestCase):
+    """Existing group_require_mention path now delegates to _is_mention_of_me."""
+
+    async def test_group_require_mention_uses_shared_helper(self):
+        # USER-role message in a room — mention gate applies even to humans.
+        adapter = KimiAdapter(_cfg(group_require_mention=True))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        # With a proper @-mention of us via the helper's matching logic → dispatched.
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-req",
+                "messageId": "msg-req",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-1",
+                "senderShortId": "u_user",
+                "summary": "hey @u_me",
+                "mentions": [{"short_id": "u_me"}],
+            },
+        })
+        adapter.handle_message.assert_awaited_once()
+
+        # Without a mention → dropped.
+        adapter.handle_message.reset_mock()
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-req",
+                "messageId": "msg-req-2",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-2",
+                "senderShortId": "u_user2",
+                "summary": "no mention here",
+            },
+        })
+        adapter.handle_message.assert_not_awaited()
+
+        # Bot-role sender who's in group_trusted_senders still has to mention us
+        # (require-mention gate runs AFTER role/policy filters). Confirm the
+        # shared helper is the authoritative source by flipping to assistant
+        # role with a mention + all policy.
+        adapter2 = KimiAdapter(_cfg(
+            group_require_mention=True,
+            group_allow_bot_senders="all",
+        ))
+        adapter2._me_short_id = "u_me"
+        adapter2.handle_message = AsyncMock()  # type: ignore
+        await adapter2._on_group_event(_bot_msg(
+            mentions=[{"short_id": "u_me"}],
+        ))
+        adapter2.handle_message.assert_awaited_once()
 
 
 class ConfigIntegrationTests(unittest.TestCase):
