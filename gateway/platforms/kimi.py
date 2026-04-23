@@ -872,6 +872,12 @@ class KimiAdapter(BasePlatformAdapter):
         self._dm_409_strikes: int = 0
         # One-shot warning guard for the multi-user DM collapse limitation.
         self._warned_dm_collapse: bool = False
+        # One-shot warning guards for outbound group surfaces that Kimi Claw
+        # v0.25.0's SendMessageRequest doesn't currently carry on the wire.
+        # Kept as simple bools because the warning is a one-per-process
+        # operator tripwire, not per-room metering.
+        self._warned_outbound_thread_drop: bool = False
+        self._warned_outbound_mentions_drop: bool = False
 
         # Dedup of inbound events (keyed by (source_tag, message_id))
         self._processed: deque = deque(maxlen=_DEDUP_MAXLEN)
@@ -980,9 +986,14 @@ class KimiAdapter(BasePlatformAdapter):
         - ``room:<id>``  → POST ``SendMessage`` with Kimi text blocks
 
         ``metadata`` keys:
-          - ``thread_id``: accepted for compatibility with the Hermes surface,
-            but ignored by Kimi's current ``SendMessageRequest`` protobuf.
-          - ``mentions``: list of member short_ids to @-mention
+          - ``thread_id``: accepted for compatibility with the Hermes surface.
+            Kimi Claw v0.25.0's ``SendMessageRequest`` has no thread field, so
+            threaded sends currently collapse to the underlying room with a
+            one-shot WARNING log (see ``_send_group``).
+          - ``mentions``: list of member short_ids to @-mention. Currently
+            emits a one-shot WARNING and falls through to plain text; Kimi's
+            mention-block wire shape is not yet confirmed via the surface
+            check.
         """
         if not content:
             return SendResult(success=True)
@@ -1851,6 +1862,7 @@ class KimiAdapter(BasePlatformAdapter):
             or _field(msg, "summary")
             or ""
         )
+        hydrated: Optional[Dict[str, Any]] = None
         if not text and self._hydrate_missing_text:
             try:
                 hydrated = await self._fetch_group_message(str(chat_id), str(message_id))
@@ -1939,6 +1951,8 @@ class KimiAdapter(BasePlatformAdapter):
             return
 
         thread_id = _field(msg, "threadId", "thread_id")
+        if not thread_id and hydrated:
+            thread_id = _field(hydrated, "threadId", "thread_id")
         reply_to = msg.get("reply_to") or msg.get("replyTo") or {}
         reply_to_message_id = reply_to.get("message_id") if isinstance(reply_to, dict) else None
         reply_to_text = reply_to.get("text") if isinstance(reply_to, dict) else None
@@ -1969,7 +1983,14 @@ class KimiAdapter(BasePlatformAdapter):
             )
             return
 
-        chat_id_prefixed = f"{_CHATID_ROOM_PREFIX}{chat_id}"
+        # Preserve thread identity in the dispatched chat_id so the gateway's
+        # session routing keeps distinct threads inside one Kimi room in
+        # separate Hermes sessions. Without this, every thread in a busy room
+        # collapses to the same session key and threads crosstalk.
+        if thread_id:
+            chat_id_prefixed = f"{_CHATID_ROOM_PREFIX}{chat_id}/{thread_id}"
+        else:
+            chat_id_prefixed = f"{_CHATID_ROOM_PREFIX}{chat_id}"
 
         event_obj = self._build_message_event(
             kind="group",
@@ -2162,12 +2183,53 @@ class KimiAdapter(BasePlatformAdapter):
         thread_id: Optional[str],
         metadata: Dict[str, Any],
     ) -> SendResult:
-        """POST unary ``SendMessage`` with text + optional attachments."""
-        del reply_to, thread_id  # SendMessageRequest has chatId + blocks only.
+        """POST unary ``SendMessage`` with text + optional attachments.
+
+        Kimi Claw v0.25.0's ``SendMessageRequest`` wire protocol exposes only
+        ``chatId`` and ``blocks``. Two caller-visible affordances therefore
+        don't round-trip today:
+
+        - ``thread_id`` (either from ``room:<uuid>/<tid>`` or
+          ``metadata["thread_id"]``): collapses to the underlying room. The
+          reply shows up at the room level instead of in the intended thread.
+        - ``metadata["mentions"]``: ignored. The call falls through to the
+          plain-text block, which means Kimi renders ``@u_foo`` as ordinary
+          characters rather than a mention pill — no notification, and
+          mention-gated bots won't see the reply.
+
+        Both were previously silently dropped. They now emit a one-shot
+        WARNING so operators can see the gap. Explicit wire support for
+        either will be added here when the Kimi Claw surface script confirms
+        the field shapes (thread_id on ``SendMessageRequest``; a mention
+        block variant alongside ``text`` / ``resourceLink``).
+        """
+        del reply_to  # SendMessageRequest has no reply-to field on the wire.
+        if thread_id and not self._warned_outbound_thread_drop:
+            logger.warning(
+                "Kimi groups: outbound thread_id=%r on room=%r is not "
+                "representable on SendMessageRequest (Kimi Claw v0.25.0 — "
+                "chatId + blocks only). Reply will target the underlying "
+                "room, not the thread. Further drops suppressed.",
+                thread_id, room_id,
+            )
+            self._warned_outbound_thread_drop = True
+
+        mentions = metadata.get("mentions") if metadata else None
+        if isinstance(mentions, list) and mentions and not self._warned_outbound_mentions_drop:
+            logger.warning(
+                "Kimi groups: metadata.mentions=%r on room=%r falls through "
+                "to plain text — Kimi Claw v0.25.0's block protobuf has no "
+                "confirmed mention variant yet. Reply renders @short_id as "
+                "text, producing no mention pill and no push notification. "
+                "Further drops suppressed.",
+                mentions, room_id,
+            )
+            self._warned_outbound_mentions_drop = True
+
         blocks: List[Dict[str, Any]] = []
         if content:
             blocks.append(_build_text_block(content))
-        if "attachments" in metadata:
+        if metadata and "attachments" in metadata:
             for attachment in metadata["attachments"]:
                 if not isinstance(attachment, dict):
                     continue
@@ -2456,7 +2518,15 @@ async def send_kimi_message(
         room_id, inline_thread = room_and_thread.split("/", 1)
     else:
         room_id, inline_thread = room_and_thread, None
-    del thread_id, inline_thread  # SendMessageRequest has no thread field.
+    effective_thread = thread_id or inline_thread
+    if effective_thread:
+        logger.warning(
+            "Kimi groups: standalone send_kimi_message thread_id=%r on "
+            "room=%r is not representable on SendMessageRequest (Kimi "
+            "Claw v0.25.0 — chatId + blocks only). Reply will target the "
+            "underlying room, not the thread.",
+            effective_thread, room_id,
+        )
     media_paths = list(media_paths or [])
     blocks: List[Dict[str, Any]] = []
     if text:

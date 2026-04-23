@@ -121,7 +121,11 @@ Kimi exposes two distinct address spaces that the adapter normalises via a prefi
 
 The `dm:` / `room:` prefix is what `send_message_tool`, cron delivery, and any adapter-aware tool consume — just pass the full prefixed id.
 
-Kimi Claw v0.25.0's `SendMessageRequest` contains only `chatId` and `blocks`; there is no outbound `thread_id` field. Hermes accepts the thread-suffixed form for routing compatibility, but outbound group sends target the underlying room/chat id.
+Kimi Claw v0.25.0's `SendMessageRequest` contains only `chatId` and `blocks`; there is no outbound `thread_id` field.
+
+**Inbound threads**: when a Subscribe event carries `threadId`, the adapter preserves it in `source.chat_id` as `room:<uuid>/<thread-uuid>` so the gateway's session router keeps distinct threads in separate Hermes sessions. `SessionSource.thread_id` also carries the raw value. The same is true for messages hydrated via `ListMessages` when the Subscribe push was a stub.
+
+**Outbound threads**: sends to a thread-suffixed chat id currently collapse to the underlying room (unary `SendMessage` has no thread field on the wire). The adapter emits a one-shot `WARNING` on the first threaded send per process so operators can see when a reply is not landing inside the expected thread. Full wire-level outbound threading will land once the Kimi Claw surface check confirms the field shape.
 
 ## Behaviour
 
@@ -141,6 +145,7 @@ Kimi Claw v0.25.0's `SendMessageRequest` contains only `chatId` and `blocks`; th
 - Local files sent to group rooms are uploaded to Kimi's `/files:upload` endpoint and delivered as `kimi-file://` resource links.
 - Inbound `kimi-file://` blocks are resolved through Kimi's file metadata endpoint and downloaded into Hermes' local Kimi file cache before entering the agent media pipeline.
 - Optional `group_require_mention` mode only responds when the bot is @-mentioned.
+- Outbound mentions: callers passing `metadata["mentions"]` to `send()` currently fall through to a plain-text block with a one-shot `WARNING` log. Kimi Claw v0.25.0's block protobuf has no confirmed mention variant yet; until the surface check lands the wire shape, outbound `@short_id` renders as text (no mention pill, no push notification). Serialization will replace the fall-through when the variant is confirmed.
 
 ## Group-room gating
 
@@ -184,6 +189,10 @@ The tool uses the same native adapter and `KIMI_BOT_TOKEN`; it does not install 
 **Group file support is native; DM file sends are text fallback only.** Group-room sends can upload local files and send resource links. Inbound group `kimi-file://` links are resolved into local cache files for the agent. The standalone DM ACP path has no currently mapped proactive file-send surface outside a live websocket reply, so local DM attachments are represented as text links.
 
 **Streaming group sends are unary for now.** The current Kimi Claw package exposes `SendMessageStream`, but Hermes currently sends group replies with unary `SendMessage`. This keeps the first adapter implementation aligned with Hermes' existing gateway send contract; streaming parity is a future delivery-semantics change.
+
+**Outbound thread routing collapses to the underlying room.** Inbound thread identity is preserved through `source.chat_id` (see [Chat-id format](#chat-id-format)), but outbound `SendMessageRequest` has no thread field in the observed Kimi Claw v0.25.0 surface. The adapter emits a one-shot `WARNING` on the first threaded send per process instead of failing silently. When the surface check confirms a `thread_id` field, this will become a wire-level pass-through.
+
+**Outbound mention rendering falls through to plain text.** Callers passing `metadata["mentions"]` trigger a one-shot `WARNING`; the text block goes out unchanged, so `@u_foo` renders as ordinary characters instead of a mention pill. Kimi's block protobuf has no confirmed mention variant yet in the surface check; when the shape lands, outbound mentions will serialize into proper block entries with notification semantics.
 
 **Room/thread admin affordances are intentionally not exposed.** The Kimi IM generated service includes broader room, thread, audience, and admin methods. Hermes exposes read/send basics via `kimi_im`; mutating/admin operations should be added only behind explicit approval and tests because they affect real Kimi rooms.
 

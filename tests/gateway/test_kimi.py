@@ -948,6 +948,241 @@ class GroupRequireMentionSharedHelperTests(unittest.IsolatedAsyncioTestCase):
         adapter2.handle_message.assert_awaited_once()
 
 
+class ThreadRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """Inbound/outbound thread routing preserves thread identity.
+
+    Kimi Claw v0.25.0's ``SendMessageRequest`` has no thread field on the
+    wire. Inbound threaded messages are still tagged so gateway sessions
+    stay isolated per-thread; outbound sends to a threaded chat_id WARN
+    on first occurrence instead of silently collapsing.
+    """
+
+    async def test_inbound_thread_chat_id_preserved(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-t1",
+                "messageId": "msg-t1",
+                "status": "STATUS_COMPLETED",
+                "senderId": "user-1",
+                "senderShortId": "u1",
+                "threadId": "thread-abc",
+                "summary": "hello in a thread",
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.source.chat_id, "room:chat-t1/thread-abc")
+        # SessionSource also carries the raw thread_id for routing helpers.
+        self.assertEqual(event.source.thread_id, "thread-abc")
+
+    async def test_inbound_no_thread_chat_id_room_only(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-t2",
+                "messageId": "msg-t2",
+                "status": "STATUS_COMPLETED",
+                "senderId": "user-2",
+                "senderShortId": "u2",
+                "summary": "no thread",
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        # No slash — plain room id only.
+        self.assertEqual(event.source.chat_id, "room:chat-t2")
+        self.assertNotIn("/", event.source.chat_id)
+
+    async def test_inbound_hydrated_thread_id_preserved(self):
+        """Thread id on the hydrated wrapper is preserved when the Subscribe
+        event itself was a lightweight stub."""
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-t3",
+            "senderId": "user-3",
+            "senderShortId": "u3",
+            "threadId": "thread-from-hydration",
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": "hydrated text"}}},
+            ],
+        })  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-t3",
+                "messageId": "msg-t3",
+                "status": "STATUS_COMPLETED",
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.source.chat_id, "room:chat-t3/thread-from-hydration")
+
+    async def test_outbound_thread_suffix_parsed_not_dropped(self):
+        """Sending to ``room:<uuid>/<tid>`` warns about thread collapse on
+        first occurrence instead of silently targeting the plain room."""
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-t1"})  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING) as cm:
+            result = await adapter.send("room:chat-t4/thread-xyz", "hello thread")
+
+        self.assertTrue(result.success)
+        # WARNING fired exactly once, references the thread id and the room.
+        self.assertTrue(
+            any(
+                r.levelno == logging.WARNING
+                and "thread_id='thread-xyz'" in r.getMessage()
+                and "chat-t4" in r.getMessage()
+                for r in cm.records
+            ),
+            f"expected WARNING about thread drop, got: {[r.getMessage() for r in cm.records]}",
+        )
+        # Payload still hits Kimi at the room level.
+        _method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(body["chatId"], "chat-t4")
+
+    async def test_outbound_thread_warning_is_one_shot(self):
+        """Second threaded send to the same adapter instance does not re-warn."""
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-t2"})  # type: ignore
+
+        # Prime: first send consumes the warning.
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING):
+            await adapter.send("room:chat-t5/tid1", "first")
+
+        # Second send: attach a record-capturing handler directly instead of
+        # assertLogs (which fails when zero records are emitted).
+        captured: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = captured.append  # type: ignore[assignment]
+        kimi_logger = logging.getLogger("gateway.platforms.kimi")
+        kimi_logger.addHandler(handler)
+        try:
+            await adapter.send("room:chat-t5/tid2", "second")
+        finally:
+            kimi_logger.removeHandler(handler)
+        self.assertFalse(
+            any(
+                r.levelno >= logging.WARNING
+                and "thread_id=" in r.getMessage()
+                for r in captured
+            ),
+            f"thread drop WARNING should be one-shot, got: {[r.getMessage() for r in captured]}",
+        )
+
+
+class OutboundMentionRenderingTests(unittest.IsolatedAsyncioTestCase):
+    """Outbound ``metadata['mentions']`` is no longer silently dropped.
+
+    Kimi Claw v0.25.0 has no confirmed mention-block wire shape, so the
+    adapter emits a WARNING and falls through to plain text. When the
+    surface check confirms a variant, this path can serialize instead.
+    """
+
+    async def test_outbound_mentions_metadata_serialized(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-m1"})  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING) as cm:
+            result = await adapter._send_group(
+                "chat-m1",
+                "hey @u_bob",
+                reply_to=None,
+                thread_id=None,
+                metadata={"mentions": ["u_bob"]},
+            )
+
+        self.assertTrue(result.success)
+        self.assertTrue(
+            any(
+                r.levelno == logging.WARNING
+                and "metadata.mentions" in r.getMessage()
+                and "u_bob" in r.getMessage()
+                for r in cm.records
+            ),
+            f"expected WARNING about mention fall-through, got: {[r.getMessage() for r in cm.records]}",
+        )
+        # Plain text block still goes out — existing send contract preserved.
+        _method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(body["chatId"], "chat-m1")
+        self.assertEqual(len(body["blocks"]), 1)
+        self.assertEqual(body["blocks"][0]["text"]["content"], "hey @u_bob")
+
+    async def test_outbound_mentions_empty_metadata_plain_text_only(self):
+        """No mentions → no WARNING, plain text path unchanged."""
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-m2"})  # type: ignore
+
+        captured: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = captured.append  # type: ignore[assignment]
+        kimi_logger = logging.getLogger("gateway.platforms.kimi")
+        kimi_logger.addHandler(handler)
+        try:
+            result = await adapter._send_group(
+                "chat-m2",
+                "hello",
+                reply_to=None,
+                thread_id=None,
+                metadata={},
+            )
+        finally:
+            kimi_logger.removeHandler(handler)
+
+        self.assertTrue(result.success)
+        self.assertFalse(
+            any(
+                "metadata.mentions" in r.getMessage()
+                for r in captured
+            ),
+            f"no mentions means no mention warning, got: {[r.getMessage() for r in captured]}",
+        )
+        # Also covers metadata=None via empty-dict default in the caller.
+        _method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(body["blocks"][0]["text"]["content"], "hello")
+
+    async def test_outbound_mentions_warning_is_one_shot(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-m3"})  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING):
+            await adapter._send_group(
+                "chat-m3", "first", reply_to=None, thread_id=None,
+                metadata={"mentions": ["u_one"]},
+            )
+
+        captured: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = captured.append  # type: ignore[assignment]
+        kimi_logger = logging.getLogger("gateway.platforms.kimi")
+        kimi_logger.addHandler(handler)
+        try:
+            await adapter._send_group(
+                "chat-m3", "second", reply_to=None, thread_id=None,
+                metadata={"mentions": ["u_two"]},
+            )
+        finally:
+            kimi_logger.removeHandler(handler)
+        self.assertFalse(
+            any(
+                r.levelno >= logging.WARNING
+                and "metadata.mentions" in r.getMessage()
+                for r in captured
+            ),
+            f"mention drop WARNING should be one-shot, got: {[r.getMessage() for r in captured]}",
+        )
+
+
 class ConfigIntegrationTests(unittest.TestCase):
     """Platform enum + env-var pickup via gateway.config."""
 
