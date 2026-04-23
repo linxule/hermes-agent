@@ -119,6 +119,15 @@ _RPC_TIMEOUT_S = 30.0
 _RECONNECT_MIN_S = 2.0
 _RECONNECT_MAX_S_DEFAULT = 60.0
 
+# DM application-level keepalive interval. Kimi's server idle-closes the WS
+# at ~60s when no ACP frames flow; WS-protocol PING frames do NOT satisfy
+# its liveness check (observed code=1006 close at exactly 60s post-connect
+# during an idle window). We emit `$/ping` JSON-RPC notifications well under
+# the 60s window to reset the server's idle timer. `$/`-prefixed methods are
+# the LSP/JSON-RPC convention for implementation-specific notifications and
+# MUST be ignored by peers that don't recognize them.
+_DM_APP_KEEPALIVE_S_DEFAULT = 25.0
+
 # Dedup ring buffer size — covers Kimi's replay window on Subscribe reconnect.
 _DEDUP_MAXLEN = 2000
 
@@ -326,6 +335,9 @@ class KimiAdapter(BasePlatformAdapter):
         )
         self._ws_ping_interval: int = int(config.extra.get("ws_ping_interval", 15))
         self._ws_ping_timeout: int = int(config.extra.get("ws_ping_timeout", 60))
+        self._dm_app_keepalive_s: float = float(
+            config.extra.get("dm_app_keepalive_s", _DM_APP_KEEPALIVE_S_DEFAULT)
+        )
         self._startup_grace_s: float = float(config.extra.get("startup_grace_s", 30))
 
         # Runtime state
@@ -599,6 +611,10 @@ class KimiAdapter(BasePlatformAdapter):
                 self._ws = ws
                 self._dm_fake_session_id = None
                 self._dm_observed_kimi_sid = None
+                self._dm_inflight.clear()
+                keepalive_task = asyncio.create_task(
+                    self._dm_app_keepalive(ws), name="kimi-dm-keepalive"
+                )
                 try:
                     async for frame in ws:
                         if isinstance(frame, bytes):
@@ -612,6 +628,11 @@ class KimiAdapter(BasePlatformAdapter):
                         if isinstance(msg, dict):
                             await self._dm_on_inbound_frame(msg)
                 finally:
+                    keepalive_task.cancel()
+                    try:
+                        await keepalive_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     self._ws = None
             return 0
         except ConnectionClosed as exc:
@@ -632,6 +653,35 @@ class KimiAdapter(BasePlatformAdapter):
                 return 3
             logger.warning("Kimi DM: connection error: %r", exc)
             return 0
+
+    async def _dm_app_keepalive(self, ws: Any) -> None:
+        """Emit `$/ping` JSON-RPC notifications to prevent Kimi's 60s idle close.
+
+        Kimi's server idle-closes the WebSocket at ~60 seconds when no
+        application-level ACP frames flow; WS-protocol PING frames (handled
+        automatically by the `websockets` library) do NOT satisfy its
+        liveness check. This was confirmed by observing code=1006 closes at
+        exactly 60s post-connect during idle windows (no user messages, no
+        outbound session/update notifications).
+
+        `$/`-prefixed methods are the LSP / JSON-RPC convention for
+        implementation-specific notifications that peers MUST silently
+        ignore when unrecognized, so this is safe for any ACP-aware
+        counterparty.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._dm_app_keepalive_s)
+                try:
+                    await ws.send(json.dumps(
+                        {"jsonrpc": "2.0", "method": "$/ping", "params": {}},
+                        separators=(",", ":"),
+                    ))
+                    logger.debug("Kimi DM: $/ping keepalive sent")
+                except ConnectionClosed:
+                    return
+        except asyncio.CancelledError:
+            return
 
     def _ws_upgrade_headers(self) -> Dict[str, str]:
         """Build headers for the DM WS upgrade, including group-gate spoof."""
