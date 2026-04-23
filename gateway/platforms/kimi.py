@@ -20,10 +20,11 @@ credential:
 The adapter owns no subprocess. Messages flow directly into
 ``BasePlatformAdapter.handle_message`` via ``self._message_handler``.
 
-Group-room participation requires spoofed ``X-Kimi-OpenClaw-*`` runtime headers
-on the DM WebSocket upgrade (Kimi's server enforces a minimum OpenClaw version
-of ``2026.3.13`` for group-chat gating). Defaults in ``_GROUP_GATE_DEFAULTS``
-unlock group access out of the box; override via ``config.extra``.
+Group-room participation requires OpenClaw runtime metadata headers on the IM
+RPC path. Kimi Claw gathers these from ``openclaw --version``,
+``openclaw skills list --json``, and ``openclaw plugins list --json``; this
+adapter supplies conservative defaults and lets deployments override them via
+``config.extra``.
 
 References:
     - Connect protocol spec: https://connectrpc.com/docs/protocol
@@ -34,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import struct
@@ -41,6 +43,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 try:
@@ -60,12 +63,14 @@ except ImportError:
     _WEBSOCKETS_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import build_session_key
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
 )
+from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_BASE_URL = "https://www.kimi.com/api-ws"
+_DEFAULT_KIMIAPI_HOST = "https://www.kimi.com/api-claw"
 _DEFAULT_DM_WS_URL = "wss://www.kimi.com/api-claw/bots/agent-ws"
 _IM_SERVICE = "kimi.gateway.im.v1.IMService"
 
@@ -92,15 +98,15 @@ _CHATID_ROOM_PREFIX = "room:"
 # WS close codes that indicate permanent auth failure
 _PERMANENT_WS_CODES = {4001}  # kimi-claw's auth-failed sentinel
 
-# Group-gate header defaults. Kimi's server refuses WebSocket upgrades for
-# group-room participation unless these OpenClaw runtime headers meet the
-# minimum CalVer (2026.3.13). Defaults here unlock group access; cosmetic
-# fields like claw_id auto-generate a unique value per adapter instance.
+# Group-gate header defaults. Kimi's IM service refuses group-room
+# participation unless these OpenClaw runtime headers meet the minimum CalVer
+# (2026.3.13). Defaults here unlock group access; cosmetic fields like
+# claw_id auto-generate a unique value per adapter instance.
 _GROUP_GATE_DEFAULTS = {
     "claw_version": "0.25.0",
     "openclaw_version": "2026.3.13",
-    "openclaw_plugins": "kimi-claw",
-    "openclaw_skills": "",
+    "openclaw_plugins": [{"id": "kimi-claw", "version": "0.25.0"}],
+    "openclaw_skills": [],
 }
 
 _SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9_-]+$", re.IGNORECASE)
@@ -141,6 +147,36 @@ _DM_APP_KEEPALIVE_S_DEFAULT = 25.0
 
 # Dedup ring buffer size — covers Kimi's replay window on Subscribe reconnect.
 _DEDUP_MAXLEN = 2000
+
+# Kimi file upload/download tuning.
+_FILE_UPLOAD_MAX_PATHS = 5
+_FILE_UPLOAD_TIMEOUT_S_DEFAULT = 120.0
+_KIMI_FILE_URI_RE = re.compile(r"^kimi-file://([^/?#\s]+)$")
+
+_CHAT_MESSAGE_COMPLETED_STATUSES = {"2", "COMPLETED", "STATUS_COMPLETED"}
+_CHAT_MESSAGE_INCOMPLETE_STATUSES = {
+    "0",
+    "1",
+    "UNSPECIFIED",
+    "GENERATING",
+    "STATUS_UNSPECIFIED",
+    "STATUS_GENERATING",
+}
+_USER_MESSAGE_ROLES = {"USER", "ROLE_USER", "MESSAGE_ROLE_USER"}
+_NON_USER_MESSAGE_ROLES = {
+    "ASSISTANT",
+    "BOT",
+    "MODEL",
+    "SYSTEM",
+    "ROLE_ASSISTANT",
+    "ROLE_BOT",
+    "ROLE_MODEL",
+    "ROLE_SYSTEM",
+    "MESSAGE_ROLE_ASSISTANT",
+    "MESSAGE_ROLE_BOT",
+    "MESSAGE_ROLE_MODEL",
+    "MESSAGE_ROLE_SYSTEM",
+}
 
 MAX_MESSAGE_LENGTH = 8000  # Kimi UI handles long messages, but chunking is kinder
 
@@ -268,6 +304,363 @@ def _extract_short_id_from_text(text: str) -> Optional[str]:
     return m.group(1).strip() or None
 
 
+def _field(obj: Dict[str, Any], *names: str) -> Any:
+    """Return the first non-empty field value across camelCase/snake_case names."""
+    for name in names:
+        value = obj.get(name)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _normalize_status(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped.upper()
+    return None
+
+
+def _chat_message_is_complete(value: Any) -> bool:
+    """Return whether a Kimi ChatMessageEvent should be dispatched.
+
+    Kimi's Connect JSON uses protobuf enum names (``STATUS_COMPLETED``), while
+    decoded generated-message tests may carry the numeric enum value (2). Legacy
+    hand-written fixtures often omit status entirely; keep those dispatchable.
+    """
+    status = _normalize_status(value)
+    if status is None:
+        return True
+    if status in _CHAT_MESSAGE_COMPLETED_STATUSES:
+        return True
+    if status in _CHAT_MESSAGE_INCOMPLETE_STATUSES:
+        return False
+    # Unknown future status: prefer visibility over silent drops.
+    return True
+
+
+def _chat_message_is_user_role(value: Any) -> bool:
+    """Return whether a Kimi ChatMessage role is dispatchable as user input."""
+    role = _normalize_status(value)
+    if role is None:
+        return True
+    if role in _USER_MESSAGE_ROLES:
+        return True
+    if role in _NON_USER_MESSAGE_ROLES:
+        return False
+    # Unknown future roles are not safe to treat as user prompts.
+    return False
+
+
+def _event_payload(event: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Normalize Kimi IM event oneof shapes to ``(case, value)``.
+
+    On the wire, Connect/protobuf JSON uses top-level oneof field names like
+    ``{"chatMessage": {...}}``. Kimi's generated JS objects use
+    ``{"payload": {"case": "chatMessage", "value": {...}}}``. Older local
+    tests used ``{"message": {...}}``. Accept all three.
+    """
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        case = payload.get("case")
+        value = payload.get("value")
+        if isinstance(case, str) and isinstance(value, dict):
+            return case, value
+
+    for case in ("chatMessage", "chat_message", "message", "ping", "reconnect", "typing"):
+        value = event.get(case)
+        if isinstance(value, dict):
+            normalized = "chatMessage" if case in ("chat_message", "message") else case
+            return normalized, value
+
+    # Legacy tests sometimes pass the message fields at the top level.
+    if _field(event, "chatId", "chat_id") and _field(event, "messageId", "message_id"):
+        return "chatMessage", event
+
+    return None, {}
+
+
+def _block_text(block: Any) -> Optional[str]:
+    if not isinstance(block, dict):
+        return None
+
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        case = content.get("case")
+        value = content.get("value")
+        if case == "text" and isinstance(value, dict):
+            text = _field(value, "content", "text")
+            return text if isinstance(text, str) else None
+        for key in ("text", "textBlock"):
+            nested = content.get(key)
+            if isinstance(nested, dict):
+                text = _field(nested, "content", "text")
+                return text if isinstance(text, str) else None
+
+    for key in ("text", "textBlock"):
+        nested = block.get(key)
+        if isinstance(nested, dict):
+            text = _field(nested, "content", "text")
+            return text if isinstance(text, str) else None
+        if isinstance(nested, str):
+            return nested
+
+    text = _field(block, "contentText", "content_text")
+    return text if isinstance(text, str) else None
+
+
+def _resource_link_uri(block: Any) -> Optional[str]:
+    if not isinstance(block, dict):
+        return None
+
+    candidates: List[Any] = []
+    content = block.get("content")
+    if isinstance(content, dict):
+        if content.get("case") == "resourceLink" and isinstance(content.get("value"), dict):
+            candidates.append(content["value"])
+        for key in ("resourceLink", "resource_link"):
+            nested = content.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+
+    for key in ("resourceLink", "resource_link"):
+        nested = block.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    for candidate in candidates:
+        uri = _field(candidate, "uri", "url", "downloadUrl", "download_url")
+        if isinstance(uri, str) and uri:
+            return uri
+    return None
+
+
+def _extract_blocks_payload(msg: Dict[str, Any]) -> Tuple[str, List[str], List[str]]:
+    text_parts: List[str] = []
+    media_urls: List[str] = []
+    media_types: List[str] = []
+
+    blocks = msg.get("blocks") if isinstance(msg.get("blocks"), list) else []
+    for block in blocks:
+        text = _block_text(block)
+        if text:
+            text_parts.append(text)
+        uri = _resource_link_uri(block)
+        if uri:
+            media_urls.append(uri)
+            media_types.append("resource_link")
+
+    text = "\n".join(text_parts).strip()
+    return text, media_urls, media_types
+
+
+def _build_text_block(text: str) -> Dict[str, Any]:
+    """Build Kimi SendMessageRequest block JSON using protobuf JSON names."""
+    return {
+        "id": f"hermes_{uuid.uuid4().hex}",
+        "text": {"content": text},
+    }
+
+
+def _build_resource_link_block(resource: Dict[str, Any]) -> Dict[str, Any]:
+    uri = str(_field(resource, "uri", "url", "downloadUrl", "download_url") or "")
+    title = str(_field(resource, "title", "name", "fileName", "file_name") or uri)
+    return {
+        "id": f"hermes_{uuid.uuid4().hex}",
+        "resourceLink": {
+            "title": title,
+            "uri": uri,
+            "downloadUrl": str(_field(resource, "downloadUrl", "download_url") or uri),
+            "etag": str(_field(resource, "etag") or ""),
+            "sizeBytes": int(_field(resource, "sizeBytes", "size_bytes") or 0),
+        },
+    }
+
+
+def _infer_mime_type(path: str) -> str:
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+def _sanitize_kimi_file_name(name: str) -> str:
+    base = Path(name).name.strip()
+    base = re.sub(r"[\x00-\x1f\x7f/\\]+", "_", base)
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("._")
+    return (base[:120] or "file")
+
+
+def _parse_kimi_file_id(uri: str) -> Optional[str]:
+    match = _KIMI_FILE_URI_RE.match(uri.strip())
+    return match.group(1) if match else None
+
+
+def _origin_from_url(url: str, fallback: str = "https://www.kimi.com") -> str:
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        pass
+    return fallback.rstrip("/")
+
+
+def _upload_endpoint(kimiapi_host: str) -> str:
+    host = (kimiapi_host or _DEFAULT_KIMIAPI_HOST).strip().rstrip("/")
+    if host.endswith("/files:upload"):
+        return host
+    origin = _origin_from_url(host)
+    return f"{origin}/api-claw/files:upload"
+
+
+def _file_metadata_endpoint(kimiapi_host: str, file_id: str) -> str:
+    origin = _origin_from_url(kimiapi_host or _DEFAULT_KIMIAPI_HOST)
+    return f"{origin}/api-claw/files/{file_id}"
+
+
+async def _upload_kimi_file(
+    session: Any,
+    *,
+    path: str,
+    bot_token: str,
+    upload_url: str,
+    timeout_s: float,
+) -> Dict[str, Any]:
+    file_path = Path(path).expanduser()
+    if not file_path.is_file():
+        raise KimiProtocolError(f"Kimi upload path is not a readable file: {path}")
+
+    file_name = file_path.name
+    mime_type = _infer_mime_type(str(file_path))
+    form = aiohttp.FormData()
+    with file_path.open("rb") as handle:
+        form.add_field("file", handle, filename=file_name, content_type=mime_type)
+        async with session.post(
+            upload_url,
+            data=form,
+            headers={"X-Kimi-Bot-Token": bot_token},
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            raw = await resp.read()
+            if resp.status in (401, 403):
+                raise KimiAuthError(f"upload auth failed HTTP {resp.status}")
+            if resp.status >= 400:
+                retryable = resp.status >= 500 or resp.status == 429
+                exc = KimiTransientError if retryable else KimiRpcError
+                raise exc(f"upload failed HTTP {resp.status}: {raw[:200]!r}")
+            try:
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise KimiProtocolError(f"upload returned bad JSON: {exc}") from exc
+
+    file_obj = data.get("file") if isinstance(data, dict) else None
+    if not isinstance(file_obj, dict):
+        raise KimiProtocolError("upload response missing file object")
+    file_id = _field(file_obj, "id")
+    if not isinstance(file_id, str) or not file_id:
+        raise KimiProtocolError("upload response missing file.id")
+    meta = file_obj.get("meta") if isinstance(file_obj.get("meta"), dict) else {}
+    return {
+        "uri": f"kimi-file://{file_id}",
+        "name": _field(meta, "name") or file_name,
+        "mimeType": _field(meta, "contentType", "content_type") or mime_type,
+        "sizeBytes": file_path.stat().st_size,
+    }
+
+
+async def _upload_kimi_files(
+    session: Any,
+    *,
+    paths: List[str],
+    bot_token: str,
+    upload_url: str,
+    timeout_s: float,
+) -> List[Dict[str, Any]]:
+    if len(paths) > _FILE_UPLOAD_MAX_PATHS:
+        raise KimiProtocolError(
+            f"Kimi upload supports at most {_FILE_UPLOAD_MAX_PATHS} files per message"
+        )
+    uploaded: List[Dict[str, Any]] = []
+    for path in paths:
+        uploaded.append(await _upload_kimi_file(
+            session,
+            path=path,
+            bot_token=bot_token,
+            upload_url=upload_url,
+            timeout_s=timeout_s,
+        ))
+    return uploaded
+
+
+def _header_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, (list, dict)):
+        if not value:
+            return None
+        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    return str(value)
+
+
+def _normalize_openclaw_plugins(value: Any, claw_version: Any) -> Any:
+    """Accept legacy string config while emitting Kimi Claw's JSON shape."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] in "[{":
+        return value
+    return [{
+        "id": stripped,
+        "version": str(claw_version or _GROUP_GATE_DEFAULTS["claw_version"]),
+    }]
+
+
+def _normalize_openclaw_skills(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] in "[{":
+        return value
+    return [item.strip() for item in stripped.split(",") if item.strip()]
+
+
+def _runtime_headers(
+    *,
+    bot_token: Optional[str] = None,
+    claw_version: Any = None,
+    openclaw_version: Any = None,
+    claw_id: Any = None,
+    openclaw_plugins: Any = None,
+    openclaw_skills: Any = None,
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    if bot_token:
+        headers["X-Kimi-Bot-Token"] = bot_token
+    plugins = _normalize_openclaw_plugins(openclaw_plugins, claw_version)
+    skills = _normalize_openclaw_skills(openclaw_skills)
+    for name, value in (
+        ("X-Kimi-Claw-Version", claw_version),
+        ("X-Kimi-OpenClaw-Version", openclaw_version),
+        ("X-Kimi-Claw-ID", claw_id),
+        ("X-Kimi-OpenClaw-Plugins", plugins),
+        ("X-Kimi-OpenClaw-Skills", skills),
+    ):
+        header = _header_value(value)
+        if header:
+            headers[name] = header
+    return headers
+
+
 def _split_for_streaming(text: str, chunk_size: int) -> List[str]:
     """Split ``text`` for progressive DM streaming.
 
@@ -339,8 +732,9 @@ class KimiAdapter(BasePlatformAdapter):
     Chat-id scheme in MessageEvent.source.chat_id:
       - ``dm:im:kimi:main`` for the single DM channel (Kimi's sentinel
         sessionId)
-      - ``room:<uuid>`` for group rooms; threads carried as
-        ``SessionSource.thread_id`` per Hermes convention.
+      - ``room:<uuid>`` for group rooms. Inbound thread-like metadata is kept
+        on ``SessionSource.thread_id`` when present, but current Kimi
+        ``SendMessageRequest`` does not accept an outbound thread field.
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -361,7 +755,24 @@ class KimiAdapter(BasePlatformAdapter):
 
         # Endpoints
         self._base_url: str = config.extra.get("base_url", _DEFAULT_BASE_URL).rstrip("/")
+        self._kimiapi_host: str = config.extra.get(
+            "kimiapi_host",
+            config.extra.get("kimiapiHost", _DEFAULT_KIMIAPI_HOST),
+        ).rstrip("/")
+        self._upload_url: str = config.extra.get(
+            "upload_url",
+            _upload_endpoint(self._kimiapi_host),
+        )
         self._dm_ws_url: str = config.extra.get("dm_ws_url", _DEFAULT_DM_WS_URL)
+        self._file_timeout_s: float = float(
+            config.extra.get("file_timeout_s", _FILE_UPLOAD_TIMEOUT_S_DEFAULT)
+        )
+        self._file_download_dir: Path = Path(
+            config.extra.get(
+                "file_download_dir",
+                str(get_hermes_dir("cache/kimi_files", "kimi_file_cache")),
+            )
+        ).expanduser()
 
         # Channel enable flags
         self._enable_dms: bool = bool(config.extra.get("enable_dms", True))
@@ -377,10 +788,10 @@ class KimiAdapter(BasePlatformAdapter):
         self._claw_id: str = config.extra.get("claw_id") or (
             f"hermes-kimi-{uuid.uuid4().hex[:16]}"
         )
-        self._openclaw_plugins: str = config.extra.get(
+        self._openclaw_plugins: Any = config.extra.get(
             "openclaw_plugins", _GROUP_GATE_DEFAULTS["openclaw_plugins"]
         )
-        self._openclaw_skills: str = config.extra.get(
+        self._openclaw_skills: Any = config.extra.get(
             "openclaw_skills", _GROUP_GATE_DEFAULTS["openclaw_skills"]
         )
 
@@ -393,6 +804,9 @@ class KimiAdapter(BasePlatformAdapter):
         self._channel_prompt: Optional[str] = config.extra.get("channel_prompt")
         self._group_require_mention: bool = bool(
             config.extra.get("group_require_mention", False)
+        )
+        self._hydrate_missing_text: bool = bool(
+            config.extra.get("hydrate_missing_text", True)
         )
 
         # Reconnect tuning
@@ -538,11 +952,11 @@ class KimiAdapter(BasePlatformAdapter):
         """Route outbound message by chat_id prefix.
 
         - ``dm:<sid>``   → emit ACP ``agent_message_chunk`` frames + end_turn
-        - ``room:<id>``  → POST ``SendMessage`` (optional thread_id)
+        - ``room:<id>``  → POST ``SendMessage`` with Kimi text blocks
 
         ``metadata`` keys:
-          - ``thread_id``: group thread override (also accepted in chat_id as
-            ``room:<id>/<thread>``)
+          - ``thread_id``: accepted for compatibility with the Hermes surface,
+            but ignored by Kimi's current ``SendMessageRequest`` protobuf.
           - ``mentions``: list of member short_ids to @-mention
         """
         if not content:
@@ -590,13 +1004,14 @@ class KimiAdapter(BasePlatformAdapter):
             cached = self._rooms.get(room_id)
             if cached is None or (time.time() - cached.last_refresh_ts) > 300:
                 try:
-                    room = await self._rpc_unary("GetRoom", {"room_id": room_id})
-                except KimiRpcError:
+                    room = await self.get_group(room_id)
+                    members = await self.list_group_members(room_id)
+                except KimiAdapterError:
                     return {"chat_id": chat_id, "name": room_id, "type": "group"}
                 cached = _ChatInfoCache(
                     room_id=room_id,
                     name=room.get("name"),
-                    members=room.get("members", []) or [],
+                    members=members,
                     last_refresh_ts=time.time(),
                 )
                 self._rooms[room_id] = cached
@@ -607,6 +1022,97 @@ class KimiAdapter(BasePlatformAdapter):
                 "members": cached.members,
             }
         return {"chat_id": chat_id, "name": chat_id, "type": "unknown"}
+
+    async def get_me(self) -> Dict[str, Any]:
+        """Return the current Kimi bot/user identity."""
+        return await self._rpc_unary("GetMe", {})
+
+    async def get_group(self, room_id: str) -> Dict[str, Any]:
+        """Return one Kimi room object using GetRoom."""
+        room_resp = await self._rpc_unary("GetRoom", {"roomId": room_id})
+        room = (
+            room_resp.get("room")
+            if isinstance(room_resp.get("room"), dict)
+            else room_resp
+        )
+        return room if isinstance(room, dict) else {}
+
+    async def list_group_members(
+        self,
+        room_id: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return room members using Kimi's ListMembers RPC."""
+        members: List[Dict[str, Any]] = []
+        page_token = ""
+        for _ in range(max_pages):
+            body: Dict[str, Any] = {
+                "roomId": room_id,
+                "pageSize": page_size,
+            }
+            if page_token:
+                body["pageToken"] = page_token
+            resp = await self._rpc_unary("ListMembers", body)
+            page_members = resp.get("members")
+            if isinstance(page_members, list):
+                members.extend(m for m in page_members if isinstance(m, dict))
+            page_token = str(resp.get("nextPageToken") or "")
+            if not page_token:
+                break
+        return members
+
+    async def list_group_messages(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 20,
+        start_message_id: Optional[str] = None,
+        end_message_id: Optional[str] = None,
+        include_start_message: bool = True,
+        include_end_message: bool = True,
+        direction: str = "BACKWARD",
+    ) -> List[Dict[str, Any]]:
+        """Return recent Kimi IM message wrappers for a group or thread chat."""
+        body: Dict[str, Any] = {
+            "chatId": chat_id,
+            "pageSize": limit,
+            "direction": direction,
+            "includeStartMessage": include_start_message,
+            "includeEndMessage": include_end_message,
+            "pageToken": "",
+        }
+        if start_message_id:
+            body["startMessageId"] = start_message_id
+        if end_message_id:
+            body["endMessageId"] = end_message_id
+        resp = await self._rpc_unary("ListMessages", body)
+        messages = resp.get("messages")
+        return [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []
+
+    async def list_group_files(
+        self,
+        room_id: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return files shared in a Kimi room using ListRoomFiles."""
+        files: List[Dict[str, Any]] = []
+        page_token = ""
+        for _ in range(max_pages):
+            body: Dict[str, Any] = {"roomId": room_id, "pageSize": page_size}
+            if page_token:
+                body["pageToken"] = page_token
+            resp = await self._rpc_unary("ListRoomFiles", body)
+            page_files = resp.get("files")
+            if isinstance(page_files, list):
+                files.extend(f for f in page_files if isinstance(f, dict))
+            page_token = str(resp.get("nextPageToken") or "")
+            if not page_token:
+                break
+        return files
 
     def format_message(self, content: str) -> str:
         """Kimi renders markdown natively; pass through unchanged."""
@@ -625,16 +1131,119 @@ class KimiAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
     ) -> SendResult:
-        """Minimal image support — for groups, include URL in SendMessage body.
+        """Send image URLs as Kimi resource-link blocks for groups.
 
-        Full attachment upload (via Kimi's file upload endpoint) is left for a
-        follow-up PR. For now we best-effort include the URL inline.
+        Local images are handled by ``send_image_file`` through Kimi's upload
+        endpoint. DM image upload is not supported by Kimi's ACP chunk channel,
+        so DMs fall back to a text URL.
         """
-        text_parts = []
-        if caption:
-            text_parts.append(caption)
-        text_parts.append(image_url)
-        return await self.send(chat_id, "\n".join(text_parts))
+        if chat_id.startswith(_CHATID_ROOM_PREFIX):
+            room_and_thread = chat_id[len(_CHATID_ROOM_PREFIX):]
+            room_id, thread_id = (
+                room_and_thread.split("/", 1)
+                if "/" in room_and_thread
+                else (room_and_thread, None)
+            )
+            return await self._send_group(
+                room_id,
+                caption or "",
+                reply_to=None,
+                thread_id=thread_id,
+                metadata={
+                    "attachments": [{
+                        "uri": image_url,
+                        "title": caption or image_url,
+                    }]
+                },
+            )
+        text = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id, text)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_uploaded_file(
+            chat_id,
+            image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        metadata = dict(kwargs.get("metadata") or {})
+        if file_name:
+            metadata["file_name"] = file_name
+        return await self._send_uploaded_file(
+            chat_id,
+            file_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def _send_uploaded_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local file to Kimi and send it as a resource link."""
+        if not chat_id.startswith(_CHATID_ROOM_PREFIX):
+            return await self.send(
+                chat_id,
+                f"{caption + chr(10) if caption else ''}File: {file_path}",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        if self._http_session is None:
+            self._http_session = aiohttp.ClientSession()
+        try:
+            uploaded = await _upload_kimi_files(
+                self._http_session,
+                paths=[file_path],
+                bot_token=self._bot_token,
+                upload_url=self._upload_url,
+                timeout_s=self._file_timeout_s,
+            )
+        except KimiAuthError as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        except KimiTransientError as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+
+        if metadata and metadata.get("file_name") and uploaded:
+            uploaded[0]["name"] = metadata["file_name"]
+        room_and_thread = chat_id[len(_CHATID_ROOM_PREFIX):]
+        room_id, thread_id = (
+            room_and_thread.split("/", 1)
+            if "/" in room_and_thread
+            else (room_and_thread, None)
+        )
+        return await self._send_group(
+            room_id,
+            caption or "",
+            reply_to=reply_to,
+            thread_id=thread_id,
+            metadata={"attachments": uploaded},
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # DM WebSocket loop
@@ -794,18 +1403,14 @@ class KimiAdapter(BasePlatformAdapter):
 
     def _ws_upgrade_headers(self) -> Dict[str, str]:
         """Build headers for the DM WS upgrade, including group-gate spoof."""
-        headers = {"X-Kimi-Bot-Token": self._bot_token}
-        if self._claw_version:
-            headers["X-Kimi-Claw-Version"] = self._claw_version
-        if self._openclaw_version:
-            headers["X-Kimi-OpenClaw-Version"] = self._openclaw_version
-        if self._claw_id:
-            headers["X-Kimi-Claw-ID"] = self._claw_id
-        if self._openclaw_plugins:
-            headers["X-Kimi-OpenClaw-Plugins"] = self._openclaw_plugins
-        if self._openclaw_skills:
-            headers["X-Kimi-OpenClaw-Skills"] = self._openclaw_skills
-        return headers
+        return _runtime_headers(
+            bot_token=self._bot_token,
+            claw_version=self._claw_version,
+            openclaw_version=self._openclaw_version,
+            claw_id=self._claw_id,
+            openclaw_plugins=self._openclaw_plugins,
+            openclaw_skills=self._openclaw_skills,
+        )
 
     async def _dm_on_inbound_frame(self, msg: Dict[str, Any]) -> None:
         """Dispatch one ACP JSON-RPC frame from Kimi.
@@ -841,7 +1446,7 @@ class KimiAdapter(BasePlatformAdapter):
 
         if method == "session/cancel":
             logger.info("Kimi DM: session/cancel for sid=%s", sid)
-            # There's no in-flight cancel API in the gateway yet — log and ack.
+            await self._dm_cancel_session(sid if isinstance(sid, str) else None)
             if req_id is not None:
                 await self._dm_respond(req_id, None)
             return
@@ -929,6 +1534,29 @@ class KimiAdapter(BasePlatformAdapter):
             raw=msg,
         )
         await self.handle_message(event)
+
+    async def _dm_cancel_session(self, kimi_sid: Optional[str]) -> None:
+        """Cancel active Hermes processing for a Kimi DM ACP session."""
+        sid = kimi_sid or self._dm_observed_kimi_sid or _DM_SESSION_SENTINEL
+        chat_id = f"{_CHATID_DM_PREFIX}{sid}"
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name="Kimi DM",
+            chat_type="dm",
+            user_id=f"kimi:dm:{sid}",
+            user_name=None,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        await self.cancel_session_processing(
+            session_key,
+            release_guard=True,
+            discard_pending=True,
+        )
+        self._dm_inflight.pop(sid, None)
 
     async def _dm_respond(self, req_id: Any, result: Any) -> None:
         """Send a JSON-RPC result back over the DM WS."""
@@ -1083,73 +1711,158 @@ class KimiAdapter(BasePlatformAdapter):
     async def _on_group_event(self, event: Dict[str, Any]) -> None:
         """Handle one decoded envelope from the Subscribe firehose.
 
-        Events observed from the wire:
-          - ``{"ping": {}}``   — keepalive, ignored
-          - ``{"message": {...}}`` or top-level message fields — real event
+        Events observed from kimi-claw:
+          - ``{"ping": {}}`` — keepalive, ignored
+          - ``{"chatMessage": {...}}`` — protobuf JSON oneof
+          - ``{"payload": {"case": "chatMessage", "value": {...}}}`` —
+            generated JS shape used by kimi-claw internals
 
-        Schema for real events (best-effort extracted; TYPE_STRING fields
-        from buf.validate introspection):
+        ChatMessage fields are normalized across protobuf JSON names and older
+        local fixtures:
           ``{
-            "chat_id":   "<room-uuid>",
-            "message_id": "<uuid>",
-            "thread_id":  "<uuid>"?,
-            "text":       "...",
-            "sender": {
-              "id":        "<uuid>",
-              "short_id":  "<short>",
-              "name":      "..."
-            },
-            "sent_at":    "<ISO8601>"?,
-            "mentions":   [...]?,
-            "reply_to":   {"message_id": "...", "text": "..."}?,
-            "attachments": [{"url", "type", "name"}]?
+            "chatId":        "<room-uuid>",
+            "messageId":     "<uuid>",
+            "status":        "STATUS_COMPLETED",
+            "senderId":      "<uuid>"?,
+            "senderShortId": "<short>"?,
+            "summary":       "...",
+            "blocks":        [{"text": {"content": "..."}}]?
           }``
 
         We tolerate schema drift — missing fields just drop details silently.
         """
         if not isinstance(event, dict):
             return
-        if "ping" in event and len(event) == 1:
+        case, msg = _event_payload(event)
+        if case == "ping":
             logger.debug("Kimi groups: keepalive ping")
             return
+        if case in ("reconnect", "typing"):
+            logger.debug("Kimi groups: ignoring %s event", case)
+            return
+        if case != "chatMessage" or not msg:
+            logger.debug("Kimi groups: unsupported event shape, skipping: %.200r", event)
+            return
 
-        # Real events may be wrapped as {"message": {...}} or bare — accept both.
-        msg = event.get("message") if isinstance(event.get("message"), dict) else event
+        if not _chat_message_is_complete(_field(msg, "status")):
+            logger.debug(
+                "Kimi groups: skipping incomplete chatMessage status=%r",
+                _field(msg, "status"),
+            )
+            return
 
-        chat_id = msg.get("chat_id") or msg.get("chatId")
-        message_id = msg.get("message_id") or msg.get("messageId")
+        chat_id = _field(msg, "chatId", "chat_id")
+        message_id = _field(msg, "messageId", "message_id")
         if not (chat_id and message_id):
             logger.debug("Kimi groups: event missing chat_id/message_id, skipping: %.200r", msg)
             return
 
         sender = msg.get("sender") or {}
-        sender_id = sender.get("id") if isinstance(sender, dict) else None
+        sender_id = (
+            sender.get("id") if isinstance(sender, dict) else None
+        ) or _field(msg, "senderId", "sender_id")
+        sender_short_id = (
+            sender.get("short_id") if isinstance(sender, dict) else None
+        ) or (
+            sender.get("shortId") if isinstance(sender, dict) else None
+        ) or _field(msg, "senderShortId", "sender_short_id")
+        sender_name = (
+            sender.get("name") if isinstance(sender, dict) else None
+        ) or _field(msg, "senderName", "sender_name")
 
         # Self-message filter.
         if sender_id and self._me_id and sender_id == self._me_id:
             return
-
-        # Dedup (chat_id, message_id) — Kimi replays recent history on reconnect.
-        if self._dedup_is_duplicate("group", chat_id, message_id):
+        if sender_short_id and self._me_short_id and sender_short_id == self._me_short_id:
             return
 
         # Startup grace — ignore events older than startup_ts - grace.
-        sent_at = msg.get("sent_at") or msg.get("sentAt")
+        sent_at = _field(msg, "sentAt", "sent_at", "createTime", "create_time")
         if sent_at:
             event_ts = _parse_iso8601(sent_at)
             if event_ts and event_ts < (self._startup_ts - self._startup_grace_s):
-                logger.debug("Kimi groups: skipping stale event %s (sent_at=%s)", message_id, sent_at)
+                logger.debug(
+                    "Kimi groups: skipping stale event %s (sent_at=%s)",
+                    message_id,
+                    sent_at,
+                )
                 return
 
-        text = msg.get("text") or ""
-        thread_id = msg.get("thread_id") or msg.get("threadId")
+        block_text, media_urls, media_types = _extract_blocks_payload(msg)
+        message_role = _field(msg, "role", "messageRole", "message_role")
+        text = (
+            block_text
+            or _field(msg, "text")
+            or _field(msg, "summary")
+            or ""
+        )
+        if not text and self._hydrate_missing_text:
+            try:
+                hydrated = await self._fetch_group_message(str(chat_id), str(message_id))
+            except KimiAdapterError as exc:
+                logger.debug(
+                    "Kimi groups: failed to hydrate message %s/%s: %s",
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+            else:
+                if hydrated:
+                    hydrated_text, hydrated_urls, hydrated_types = _extract_blocks_payload(
+                        hydrated
+                    )
+                    text = (
+                        hydrated_text
+                        or _field(hydrated, "text")
+                        or _field(hydrated, "summary")
+                        or text
+                    )
+                    media_urls.extend(url for url in hydrated_urls if url not in media_urls)
+                    media_types.extend(hydrated_types)
+                    sender_id = sender_id or _field(hydrated, "senderId", "sender_id")
+                    sender_short_id = sender_short_id or _field(
+                        hydrated, "senderShortId", "sender_short_id"
+                    )
+                    sender_name = sender_name or _field(
+                        hydrated, "senderName", "sender_name"
+                    )
+                    message_role = message_role or _field(
+                        hydrated, "role", "messageRole", "message_role"
+                    )
+
+        if sender_id and self._me_id and sender_id == self._me_id:
+            return
+        if sender_short_id and self._me_short_id and sender_short_id == self._me_short_id:
+            return
+        if not _chat_message_is_user_role(message_role):
+            logger.debug(
+                "Kimi groups: skipping non-user message %s/%s role=%r",
+                chat_id,
+                message_id,
+                message_role,
+            )
+            return
+
+        if not text and not media_urls:
+            logger.debug(
+                "Kimi groups: message %s/%s has no dispatchable content",
+                chat_id,
+                message_id,
+            )
+            return
+
+        # Dedup (chat_id, message_id) after hydration/content checks. If a
+        # lightweight event fails hydration, a later replay can still deliver
+        # the full message instead of being suppressed as already processed.
+        if self._dedup_is_duplicate("group", str(chat_id), str(message_id)):
+            return
+
+        thread_id = _field(msg, "threadId", "thread_id")
         reply_to = msg.get("reply_to") or msg.get("replyTo") or {}
         reply_to_message_id = reply_to.get("message_id") if isinstance(reply_to, dict) else None
         reply_to_text = reply_to.get("text") if isinstance(reply_to, dict) else None
 
         attachments = msg.get("attachments") or []
-        media_urls: List[str] = []
-        media_types: List[str] = []
         for att in attachments if isinstance(attachments, list) else []:
             if not isinstance(att, dict):
                 continue
@@ -1158,11 +1871,18 @@ class KimiAdapter(BasePlatformAdapter):
                 media_urls.append(url)
                 media_types.append(att.get("type", "file"))
 
+        if media_urls:
+            media_urls, media_types = await self._resolve_kimi_file_media(
+                media_urls,
+                media_types,
+                message_id=str(message_id),
+            )
+
         # Mention gate: if configured to require mentions and the message
         # doesn't reference us, ignore. Supports both numeric id and short_id.
         mentions = msg.get("mentions") or []
         if self._group_require_mention:
-            mentioned_us = False
+            mentioned_us = bool(_field(msg, "mentioned"))
             for m in mentions if isinstance(mentions, list) else []:
                 mid = m.get("id") if isinstance(m, dict) else m
                 if mid in (self._me_id, self._me_short_id):
@@ -1176,12 +1896,12 @@ class KimiAdapter(BasePlatformAdapter):
 
         event_obj = self._build_message_event(
             kind="group",
-            text=text,
+            text=str(text),
             message_id=str(message_id),
             chat_id=chat_id_prefixed,
             chat_name=None,  # populated lazily via get_chat_info if needed
-            user_id=sender.get("id") if isinstance(sender, dict) else None,
-            user_name=sender.get("name") if isinstance(sender, dict) else None,
+            user_id=sender_id or (f"kimi:{sender_short_id}" if sender_short_id else None),
+            user_name=sender_name or sender_short_id,
             thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
@@ -1190,6 +1910,172 @@ class KimiAdapter(BasePlatformAdapter):
             raw=msg,
         )
         await self.handle_message(event_obj)
+
+    async def _fetch_group_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a full message wrapper when Subscribe only carries a summary."""
+        wrappers = await self.list_group_messages(
+            chat_id,
+            limit=20,
+            start_message_id=message_id,
+            end_message_id=message_id,
+            include_start_message=True,
+            include_end_message=True,
+        )
+        for wrapper in wrappers:
+            message = wrapper.get("message") if isinstance(wrapper.get("message"), dict) else {}
+            candidate_id = (
+                _field(message, "id", "messageId", "message_id")
+                or _field(wrapper, "messageId", "message_id")
+            )
+            if str(candidate_id) != str(message_id):
+                continue
+            merged = dict(message)
+            for source_key, target_key in (
+                ("senderId", "senderId"),
+                ("sender_id", "senderId"),
+                ("senderShortId", "senderShortId"),
+                ("sender_short_id", "senderShortId"),
+                ("senderName", "senderName"),
+                ("sender_name", "senderName"),
+            ):
+                value = wrapper.get(source_key)
+                if value is not None and target_key not in merged:
+                    merged[target_key] = value
+            return merged
+        return None
+
+    async def _resolve_kimi_file_media(
+        self,
+        media_urls: List[str],
+        media_types: List[str],
+        *,
+        message_id: str,
+    ) -> Tuple[List[str], List[str]]:
+        resolved_urls: List[str] = []
+        resolved_types: List[str] = []
+        for idx, uri in enumerate(media_urls):
+            media_type = media_types[idx] if idx < len(media_types) else ""
+            if isinstance(uri, str) and uri.startswith("kimi-file://"):
+                resolved = await self._resolve_kimi_file_uri(uri, message_id=message_id)
+                if resolved:
+                    resolved_urls.append(resolved["localPath"])
+                    resolved_types.append(
+                        resolved.get("contentType") or media_type or "application/octet-stream"
+                    )
+                    continue
+            resolved_urls.append(uri)
+            resolved_types.append(media_type)
+        return resolved_urls, resolved_types
+
+    async def _resolve_kimi_file_uri(
+        self,
+        uri: str,
+        *,
+        message_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        file_id = _parse_kimi_file_id(uri)
+        if not file_id:
+            logger.warning("Kimi groups: invalid kimi-file URI in message %s: %s", message_id, uri)
+            return None
+
+        self._file_download_dir.mkdir(parents=True, exist_ok=True)
+        existing = self._find_cached_kimi_file(file_id)
+        if existing:
+            return existing
+        if self._http_session is None:
+            self._http_session = aiohttp.ClientSession()
+
+        metadata_url = _file_metadata_endpoint(self._kimiapi_host, file_id)
+        try:
+            async with self._http_session.get(
+                metadata_url,
+                headers={"X-Kimi-Bot-Token": self._bot_token, "Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=self._file_timeout_s),
+            ) as resp:
+                raw = await resp.read()
+                if resp.status in (401, 403):
+                    raise KimiAuthError(f"kimi-file metadata auth failed HTTP {resp.status}")
+                if resp.status >= 400:
+                    logger.warning(
+                        "Kimi groups: kimi-file metadata failed file_id=%s HTTP %s",
+                        file_id,
+                        resp.status,
+                    )
+                    return None
+                metadata = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception as exc:
+            logger.warning("Kimi groups: kimi-file metadata failed file_id=%s: %s", file_id, exc)
+            return None
+
+        if not isinstance(metadata, dict):
+            return None
+        meta = metadata.get("meta") if isinstance(metadata.get("meta"), dict) else {}
+        name = str(_field(meta, "name") or file_id)
+        content_type = str(_field(meta, "contentType", "content_type") or "application/octet-stream")
+        blob = metadata.get("blob") if isinstance(metadata.get("blob"), dict) else {}
+        download_url = _field(blob, "signUrl", "sign_url") or self._preview_download_url(metadata)
+        if not isinstance(download_url, str) or not download_url:
+            logger.warning("Kimi groups: kimi-file metadata has no download URL file_id=%s", file_id)
+            return None
+
+        local_name = f"{file_id}_{_sanitize_kimi_file_name(name)}"
+        local_path = self._file_download_dir / local_name
+        try:
+            async with self._http_session.get(
+                download_url,
+                timeout=aiohttp.ClientTimeout(total=self._file_timeout_s),
+            ) as resp:
+                data = await resp.read()
+                if resp.status >= 400 or not data:
+                    logger.warning(
+                        "Kimi groups: kimi-file download failed file_id=%s HTTP %s",
+                        file_id,
+                        resp.status,
+                    )
+                    return None
+            local_path.write_bytes(data)
+        except Exception as exc:
+            logger.warning("Kimi groups: kimi-file download failed file_id=%s: %s", file_id, exc)
+            return None
+
+        return {
+            "fileId": file_id,
+            "name": name,
+            "contentType": content_type,
+            "localPath": str(local_path),
+        }
+
+    def _find_cached_kimi_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        prefix = f"{file_id}_"
+        try:
+            candidates = sorted(self._file_download_dir.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return None
+        for path in candidates:
+            if path.is_file() and path.name.startswith(prefix) and path.stat().st_size > 0:
+                return {
+                    "fileId": file_id,
+                    "name": path.name[len(prefix):],
+                    "contentType": _infer_mime_type(str(path)),
+                    "localPath": str(path),
+                }
+        return None
+
+    def _preview_download_url(self, metadata: Dict[str, Any]) -> Optional[str]:
+        parse_job = metadata.get("parseJob") or metadata.get("parse_job")
+        if not isinstance(parse_job, dict):
+            return None
+        result = parse_job.get("result")
+        image = result.get("image") if isinstance(result, dict) else None
+        thumbnail = image.get("thumbnail") if isinstance(image, dict) else None
+        if isinstance(thumbnail, dict):
+            url = _field(thumbnail, "previewUrl", "preview_url")
+            return url if isinstance(url, str) else None
+        return None
 
     async def _send_group(
         self,
@@ -1200,16 +2086,26 @@ class KimiAdapter(BasePlatformAdapter):
         metadata: Dict[str, Any],
     ) -> SendResult:
         """POST unary ``SendMessage`` with text + optional attachments."""
-        body: Dict[str, Any] = {"chat_id": room_id, "text": content}
-        if thread_id:
-            body["thread_id"] = thread_id
-        if reply_to:
-            body["reply_to_message_id"] = reply_to
-        if "mentions" in metadata:
-            body["mentions"] = metadata["mentions"]
+        del reply_to, thread_id  # SendMessageRequest has chatId + blocks only.
+        blocks: List[Dict[str, Any]] = []
+        if content:
+            blocks.append(_build_text_block(content))
         if "attachments" in metadata:
-            body["attachments"] = metadata["attachments"]
+            for attachment in metadata["attachments"]:
+                if not isinstance(attachment, dict):
+                    continue
+                uri = _field(attachment, "uri", "url", "downloadUrl", "download_url")
+                if isinstance(uri, str) and uri:
+                    blocks.append(_build_resource_link_block(attachment))
 
+        if not blocks:
+            return SendResult(
+                success=False,
+                error="Kimi: SendMessage requires text or attachments",
+                retryable=False,
+            )
+
+        body: Dict[str, Any] = {"chatId": room_id, "blocks": blocks}
         resp = await self._rpc_unary("SendMessage", body)
         return SendResult(
             success=True,
@@ -1269,15 +2165,25 @@ class KimiAdapter(BasePlatformAdapter):
 
     def _http_headers(self, *, streaming: bool) -> Dict[str, str]:
         """Shared HTTP headers for all Connect RPCs."""
-        return {
+        headers = {
             "Content-Type": (
                 "application/connect+json" if streaming else "application/json"
             ),
             "Connect-Protocol-Version": "1",
-            "X-Kimi-Bot-Token": self._bot_token,
             "Accept-Encoding": "identity",
             "User-Agent": "hermes-kimi-adapter/1.0",
         }
+        if streaming:
+            headers["Accept"] = "application/connect+json"
+        headers.update(_runtime_headers(
+            bot_token=self._bot_token,
+            claw_version=self._claw_version,
+            openclaw_version=self._openclaw_version,
+            claw_id=self._claw_id,
+            openclaw_plugins=self._openclaw_plugins,
+            openclaw_skills=self._openclaw_skills,
+        ))
+        return headers
 
     def _encode_envelope(self, payload: bytes, *, end_stream: bool = False) -> bytes:
         """Encode one outbound Connect envelope: ``[flag:1B][len:4B BE][body]``."""
@@ -1444,6 +2350,7 @@ async def send_kimi_message(
     text: str,
     *,
     thread_id: Optional[str] = None,
+    media_paths: Optional[List[str]] = None,
 ) -> SendResult:
     """Send a message via Kimi without instantiating the full adapter.
 
@@ -1461,23 +2368,60 @@ async def send_kimi_message(
     if not token:
         return SendResult(success=False, error="Kimi: no bot_token configured", retryable=False)
     base_url = config.extra.get("base_url", _DEFAULT_BASE_URL).rstrip("/")
+    kimiapi_host = config.extra.get(
+        "kimiapi_host",
+        config.extra.get("kimiapiHost", _DEFAULT_KIMIAPI_HOST),
+    )
+    upload_url = config.extra.get("upload_url", _upload_endpoint(kimiapi_host))
+    file_timeout_s = float(config.extra.get("file_timeout_s", _FILE_UPLOAD_TIMEOUT_S_DEFAULT))
     room_and_thread = chat_id[len(_CHATID_ROOM_PREFIX):]
     if "/" in room_and_thread:
         room_id, inline_thread = room_and_thread.split("/", 1)
     else:
         room_id, inline_thread = room_and_thread, None
-    body: Dict[str, Any] = {"chat_id": room_id, "text": text}
-    if thread_id or inline_thread:
-        body["thread_id"] = thread_id or inline_thread
+    del thread_id, inline_thread  # SendMessageRequest has no thread field.
+    media_paths = list(media_paths or [])
+    blocks: List[Dict[str, Any]] = []
+    if text:
+        blocks.append(_build_text_block(text))
     url = f"{base_url}/{_IM_SERVICE}/SendMessage"
     headers = {
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
-        "X-Kimi-Bot-Token": token,
         "User-Agent": "hermes-kimi-adapter/1.0",
     }
+    headers.update(_runtime_headers(
+        bot_token=token,
+        claw_version=config.extra.get("claw_version", _GROUP_GATE_DEFAULTS["claw_version"]),
+        openclaw_version=config.extra.get(
+            "openclaw_version", _GROUP_GATE_DEFAULTS["openclaw_version"]
+        ),
+        claw_id=config.extra.get("claw_id"),
+        openclaw_plugins=config.extra.get(
+            "openclaw_plugins", _GROUP_GATE_DEFAULTS["openclaw_plugins"]
+        ),
+        openclaw_skills=config.extra.get(
+            "openclaw_skills", _GROUP_GATE_DEFAULTS["openclaw_skills"]
+        ),
+    ))
     try:
         async with aiohttp.ClientSession() as session:
+            if media_paths:
+                uploaded = await _upload_kimi_files(
+                    session,
+                    paths=media_paths,
+                    bot_token=token,
+                    upload_url=upload_url,
+                    timeout_s=file_timeout_s,
+                )
+                blocks.extend(_build_resource_link_block(item) for item in uploaded)
+            if not blocks:
+                return SendResult(
+                    success=False,
+                    error="Kimi: SendMessage requires text or attachments",
+                    retryable=False,
+                )
+            body: Dict[str, Any] = {"chatId": room_id, "blocks": blocks}
             async with session.post(
                 url,
                 data=json.dumps(body).encode("utf-8"),
@@ -1486,9 +2430,17 @@ async def send_kimi_message(
             ) as resp:
                 raw = await resp.read()
                 if resp.status == 401 or resp.status == 403:
-                    return SendResult(success=False, error=f"auth failed HTTP {resp.status}", retryable=False)
+                    return SendResult(
+                        success=False,
+                        error=f"auth failed HTTP {resp.status}",
+                        retryable=False,
+                    )
                 if resp.status >= 400:
-                    return SendResult(success=False, error=f"HTTP {resp.status}: {raw[:200]!r}", retryable=(resp.status >= 500))
+                    return SendResult(
+                        success=False,
+                        error=f"HTTP {resp.status}: {raw[:200]!r}",
+                        retryable=(resp.status >= 500),
+                    )
                 try:
                     data = json.loads(raw.decode("utf-8")) if raw else {}
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:

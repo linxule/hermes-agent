@@ -448,7 +448,10 @@ TOOLSETS = {
 
     "hermes-kimi": {
         "description": "Kimi bot toolset - kimi.com/Moonshot AI DMs + group rooms (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + [
+            # Kimi group-room inspection/actions (gated on KIMI_BOT_TOKEN via check_fn)
+            "kimi_im",
+        ],
         "includes": []
     },
 

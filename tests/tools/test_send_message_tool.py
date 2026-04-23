@@ -195,6 +195,36 @@ class TestSendMessageTool:
         assert "access_token=***" in result["error"]
 
 
+class TestSendKimiMediaDelivery:
+    def test_send_to_platform_routes_media_to_kimi_upload(self, tmp_path):
+        media_path = tmp_path / "report.pdf"
+        media_path.write_bytes(b"%PDF-1.4\n")
+        pconfig = SimpleNamespace(enabled=True, token="km_b_prod_TEST", extra={})
+
+        with patch(
+            "tools.send_message_tool._send_kimi",
+            new=AsyncMock(return_value={"success": True, "platform": "kimi"}),
+        ) as send_mock:
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.KIMI,
+                    pconfig,
+                    "room:chat-1",
+                    "",
+                    media_files=[(str(media_path), False)],
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            pconfig,
+            "room:chat-1",
+            "",
+            thread_id=None,
+            media_files=[str(media_path)],
+        )
+
+
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):
         image_path = tmp_path / "photo.png"
@@ -808,6 +838,34 @@ class TestParseTargetRefE164:
         assert _parse_target_ref("telegram", "+15551234567")[2] is False
         assert _parse_target_ref("discord", "+15551234567")[2] is False
         assert _parse_target_ref("matrix", "+15551234567")[2] is False
+
+
+class TestParseTargetRefKimi:
+    """_parse_target_ref accepts Kimi's prefixed chat-id forms."""
+
+    def test_kimi_room_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("kimi", "room:1234-5678")
+        assert chat_id == "room:1234-5678"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_kimi_room_thread_form_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("kimi", "room:1234/thread-1")
+        assert chat_id == "room:1234/thread-1"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_kimi_dm_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("kimi", "dm:im:kimi:main")
+        assert chat_id == "dm:im:kimi:main"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_kimi_human_label_still_needs_resolution(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("kimi", "#research")
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
 
 
 class TestSendDiscordThreadId:

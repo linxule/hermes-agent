@@ -1847,12 +1847,17 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
     },
     "KIMI_ALLOWED_USERS": {
-        "description": "Comma-separated Kimi DM user ids allowed to interact (leave empty + KIMI_ALLOW_ALL_USERS=true to allow any)",
+        "description": "Comma-separated Kimi user ids allowed to interact (recommended for shared/public deployments)",
         "prompt": "Kimi Allowed Users",
         "category": "messaging",
     },
+    "KIMI_GROUP_ALLOWED_USERS": {
+        "description": "Comma-separated Kimi room IDs allowed to interact with the bot",
+        "prompt": "Kimi Group Allowed Rooms",
+        "category": "messaging",
+    },
     "KIMI_ALLOW_ALL_USERS": {
-        "description": "Allow all Kimi users without an allowlist (true/false). Kimi's bot token is per-user so normally safe.",
+        "description": "Allow all Kimi users without an allowlist (true/false). Use only for personal one-user bots.",
         "prompt": "Allow All Kimi Users",
         "category": "messaging",
     },

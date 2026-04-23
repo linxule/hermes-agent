@@ -315,9 +315,9 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `QQBOT_HOME_CHANNEL_NAME` | Display name for the QQ home channel |
 | `QQ_SANDBOX` | Route QQ Bot to the sandbox gateway for development testing (`true`/`false`). Use with a sandbox app credential from [q.qq.com](https://q.qq.com). |
 | `KIMI_BOT_TOKEN` | Kimi bot token (`km_b_prod_...`) from kimi.com's "Link existing OpenClaw" flow |
-| `KIMI_ALLOWED_USERS` | Comma-separated Kimi user IDs allowed to DM the bot |
-| `KIMI_GROUP_ALLOWED_USERS` | Comma-separated Kimi user IDs allowed to interact in group rooms |
-| `KIMI_ALLOW_ALL_USERS` | Allow all Kimi users (`true`/`false`). Safe for personal bots — bot token is per-user. |
+| `KIMI_ALLOWED_USERS` | Comma-separated Kimi user IDs allowed to use the bot |
+| `KIMI_GROUP_ALLOWED_USERS` | Comma-separated Kimi room IDs allowed to interact with the bot |
+| `KIMI_ALLOW_ALL_USERS` | Allow all Kimi users (`true`/`false`). Use only for personal one-user bots. |
 | `KIMI_HOME_CHANNEL` | Default Kimi chat for cron delivery. Format: `dm:im:kimi:main` or `room:<uuid>`. |
 | `KIMI_HOME_CHANNEL_NAME` | Display name for the Kimi home channel |
 | `KIMI_ENABLE_DMS` | Enable Kimi DM channel (ACP WebSocket) (`true`/`false`, default `true`) |

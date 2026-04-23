@@ -120,7 +120,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'kimi:room:<uuid>'"
             },
             "message": {
                 "type": "string",
@@ -323,6 +323,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "kimi" and target_ref.startswith(("room:", "dm:")):
+        return target_ref.strip(), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -529,11 +531,29 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Kimi: native upload to kimi-file:// resourceLink blocks for group rooms ---
+    if platform == Platform.KIMI and media_files:
+        last_result = None
+        media_paths = [path for path, _is_voice in media_files]
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_kimi(
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_paths if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, and signal; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, kimi, and signal; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -541,7 +561,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, and signal"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, kimi, and signal"
         )
 
     last_result = None
@@ -1513,13 +1533,14 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
-async def _send_kimi(pconfig, chat_id, message, *, thread_id=None):
+async def _send_kimi(pconfig, chat_id, message, *, thread_id=None, media_files=None):
     """Send via Kimi's Connect RPC unary SendMessage.
 
     DMs (``dm:...`` chat_id prefix) require an active WS session held by the
     gateway adapter — they cannot be delivered via this standalone path.
-    Group rooms (``room:<uuid>`` or ``room:<uuid>/<thread>``) work from any
-    context (cron jobs, tools, out-of-process scripts).
+    Group rooms (``room:<uuid>``) work from any context (cron jobs, tools,
+    out-of-process scripts). A ``room:<uuid>/<thread>`` suffix is accepted for
+    compatibility but ignored by Kimi's current SendMessageRequest protobuf.
     """
     from gateway.platforms.kimi import send_kimi_message
     result = await send_kimi_message(
@@ -1527,6 +1548,7 @@ async def _send_kimi(pconfig, chat_id, message, *, thread_id=None):
         chat_id,
         message,
         thread_id=thread_id,
+        media_paths=list(media_files or []),
     )
     if result.success:
         return {

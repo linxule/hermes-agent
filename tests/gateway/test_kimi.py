@@ -13,9 +13,10 @@ import os
 import struct
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageType, SendResult
 from gateway.platforms.kimi import (
     _CONNECT_FLAG_COMPRESSED,
@@ -33,6 +34,7 @@ from gateway.platforms.kimi import (
     _split_for_streaming,
     check_kimi_requirements,
 )
+from gateway.session import SessionSource
 
 
 class _FakeWSStatusError(Exception):
@@ -139,7 +141,33 @@ class AdapterInitTests(unittest.TestCase):
         streaming = adapter._http_headers(streaming=True)
         self.assertEqual(unary["Content-Type"], "application/json")
         self.assertEqual(streaming["Content-Type"], "application/connect+json")
+        self.assertEqual(streaming["Accept"], "application/connect+json")
         self.assertEqual(unary["X-Kimi-Bot-Token"], "km_b_prod_TEST_TOKEN")
+        self.assertEqual(unary["X-Kimi-Claw-Version"], "0.25.0")
+        self.assertEqual(unary["X-Kimi-OpenClaw-Version"], "2026.3.13")
+        self.assertIn("X-Kimi-Claw-ID", unary)
+        self.assertEqual(
+            json.loads(unary["X-Kimi-OpenClaw-Plugins"]),
+            [{"id": "kimi-claw", "version": "0.25.0"}],
+        )
+        self.assertEqual(streaming["X-Kimi-OpenClaw-Plugins"], unary["X-Kimi-OpenClaw-Plugins"])
+
+    def test_legacy_inventory_header_strings_are_normalized_to_json(self):
+        adapter = KimiAdapter(_cfg(
+            openclaw_plugins="kimi-claw",
+            openclaw_skills="kimiim,worker-safety",
+        ))
+
+        headers = adapter._http_headers(streaming=False)
+
+        self.assertEqual(
+            json.loads(headers["X-Kimi-OpenClaw-Plugins"]),
+            [{"id": "kimi-claw", "version": "0.25.0"}],
+        )
+        self.assertEqual(
+            json.loads(headers["X-Kimi-OpenClaw-Skills"]),
+            ["kimiim", "worker-safety"],
+        )
 
 
 class EnvelopeCodecTests(unittest.TestCase):
@@ -189,7 +217,9 @@ class EnvelopeParserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_end_stream_with_auth_error_raises(self):
         adapter = KimiAdapter(_cfg())
-        err_body = json.dumps({"error": {"code": "unauthenticated", "message": "token expired"}}).encode()
+        err_body = json.dumps({
+            "error": {"code": "unauthenticated", "message": "token expired"}
+        }).encode()
         stream = bytes([_CONNECT_FLAG_END_STREAM]) + struct.pack(">I", len(err_body)) + err_body
         with self.assertRaises(KimiAuthError):
             await self._collect(adapter, stream)
@@ -358,6 +388,331 @@ class MessageEventSynthesisTests(unittest.TestCase):
         self.assertEqual(event.auto_skill, "test-skill")
 
 
+class GroupEventParsingTests(unittest.IsolatedAsyncioTestCase):
+    """Kimi Subscribe protobuf-JSON events are converted into Hermes messages."""
+
+    async def test_protobuf_json_chat_message_event_dispatches_summary(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "id": "evt-1",
+            "chatMessage": {
+                "chatId": "chat-1",
+                "messageId": "msg-1",
+                "status": "STATUS_COMPLETED",
+                "senderId": "user-1",
+                "senderShortId": "u1",
+                "roomId": "room-1",
+                "summary": "hello from kimi",
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "hello from kimi")
+        self.assertEqual(event.source.chat_id, "room:chat-1")
+        self.assertEqual(event.source.user_id, "user-1")
+        self.assertEqual(event.source.user_name, "u1")
+
+    async def test_generated_payload_shape_extracts_text_block(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "id": "evt-2",
+            "payload": {
+                "case": "chatMessage",
+                "value": {
+                    "chatId": "chat-2",
+                    "messageId": "msg-2",
+                    "status": 2,
+                    "senderShortId": "u2",
+                    "blocks": [
+                        {
+                            "id": "b1",
+                            "content": {
+                                "case": "text",
+                                "value": {"content": "block text"},
+                            },
+                        }
+                    ],
+                },
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "block text")
+        self.assertEqual(event.source.user_id, "kimi:u2")
+
+    async def test_generating_status_is_not_dispatched(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "id": "evt-3",
+            "chatMessage": {
+                "chatId": "chat-3",
+                "messageId": "msg-3",
+                "status": "STATUS_GENERATING",
+                "summary": "partial",
+            },
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+
+class SendMessageShapeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_group_send_uses_kimi_blocks_request_shape(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-1"})  # type: ignore
+
+        result = await adapter._send_group(
+            "chat-1",
+            "hello",
+            reply_to="ignored",
+            thread_id="ignored",
+            metadata={},
+        )
+
+        self.assertTrue(result.success)
+        adapter._rpc_unary.assert_awaited_once()
+        method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(method, "SendMessage")
+        self.assertEqual(body["chatId"], "chat-1")
+        self.assertEqual(body["blocks"][0]["text"]["content"], "hello")
+        self.assertNotIn("text", body)
+        self.assertNotIn("chat_id", body)
+
+    async def test_group_send_supports_attachment_only_resource_link(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(return_value={"messageId": "sent-2"})  # type: ignore
+
+        result = await adapter._send_group(
+            "chat-1",
+            "",
+            reply_to=None,
+            thread_id=None,
+            metadata={"attachments": [{
+                "uri": "kimi-file://file-123",
+                "name": "report.pdf",
+                "mimeType": "application/pdf",
+                "sizeBytes": 42,
+            }]},
+        )
+
+        self.assertTrue(result.success)
+        _method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(len(body["blocks"]), 1)
+        resource = body["blocks"][0]["resourceLink"]
+        self.assertEqual(resource["uri"], "kimi-file://file-123")
+        self.assertEqual(resource["title"], "report.pdf")
+        self.assertNotIn("text", body["blocks"][0])
+
+    async def test_send_document_uploads_to_kimi_file_resource(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._http_session = MagicMock()
+        adapter._send_group = AsyncMock(return_value=SendResult(success=True, message_id="sent-3"))  # type: ignore
+        uploaded = [{
+            "uri": "kimi-file://file-456",
+            "name": "notes.txt",
+            "mimeType": "text/plain",
+        }]
+
+        with patch("gateway.platforms.kimi._upload_kimi_files", new=AsyncMock(return_value=uploaded)) as upload_mock:
+            result = await adapter.send_document("room:chat-1", "/tmp/notes.txt", caption="see attached")
+
+        self.assertTrue(result.success)
+        upload_mock.assert_awaited_once()
+        adapter._send_group.assert_awaited_once()
+        args = adapter._send_group.await_args.args
+        self.assertEqual(args[0], "chat-1")
+        self.assertEqual(args[1], "see attached")
+        self.assertEqual(adapter._send_group.await_args.kwargs["metadata"]["attachments"], uploaded)
+
+    async def test_kimi_file_media_resolution_replaces_uri_with_local_path(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._resolve_kimi_file_uri = AsyncMock(return_value={
+            "localPath": "/tmp/kimi-file/report.pdf",
+            "contentType": "application/pdf",
+        })  # type: ignore
+
+        urls, types = await adapter._resolve_kimi_file_media(
+            ["kimi-file://12345678-1234-1234-1234-123456789abc", "https://example/a.png"],
+            ["resource_link", "image/png"],
+            message_id="msg-1",
+        )
+
+        self.assertEqual(urls, ["/tmp/kimi-file/report.pdf", "https://example/a.png"])
+        self.assertEqual(types, ["application/pdf", "image/png"])
+
+
+class GroupRpcHelperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_chat_info_fetches_room_and_members(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock(side_effect=[
+            {"room": {"id": "room-1", "name": "Research Room"}},
+            {"members": [{"id": "m1", "shortId": "alice"}]},
+        ])  # type: ignore
+
+        info = await adapter.get_chat_info("room:room-1")
+
+        self.assertEqual(info["name"], "Research Room")
+        self.assertEqual(info["members"], [{"id": "m1", "shortId": "alice"}])
+        self.assertEqual(
+            adapter._rpc_unary.await_args_list[0].args,
+            ("GetRoom", {"roomId": "room-1"}),
+        )
+        self.assertEqual(adapter._rpc_unary.await_args_list[1].args[0], "ListMembers")
+        self.assertEqual(adapter._rpc_unary.await_args_list[1].args[1]["roomId"], "room-1")
+
+    async def test_empty_subscribe_event_hydrates_from_list_messages(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._rpc_unary = AsyncMock(return_value={
+            "messages": [
+                {
+                    "senderId": "user-9",
+                    "senderShortId": "u9",
+                    "message": {
+                        "id": "msg-9",
+                        "blocks": [
+                            {
+                                "content": {
+                                    "case": "text",
+                                    "value": {"content": "hydrated text"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        })  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-9",
+                "messageId": "msg-9",
+                "status": "STATUS_COMPLETED",
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "hydrated text")
+        self.assertEqual(event.source.user_id, "user-9")
+        self.assertEqual(event.source.user_name, "u9")
+        method, body = adapter._rpc_unary.await_args.args
+        self.assertEqual(method, "ListMessages")
+        self.assertEqual(body["chatId"], "chat-9")
+        self.assertEqual(body["startMessageId"], "msg-9")
+
+    async def test_failed_hydration_does_not_dispatch_or_dedup_empty_event(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock(side_effect=[
+            KimiRpcError("temporary bad cursor"),
+            {
+                "id": "msg-10",
+                "blocks": [
+                    {
+                        "content": {
+                            "case": "text",
+                            "value": {"content": "second replay text"},
+                        },
+                    }
+                ],
+            },
+        ])  # type: ignore
+        event = {
+            "chatMessage": {
+                "chatId": "chat-10",
+                "messageId": "msg-10",
+                "status": "STATUS_COMPLETED",
+            },
+        }
+
+        await adapter._on_group_event(event)
+        adapter.handle_message.assert_not_awaited()
+
+        await adapter._on_group_event(event)
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        self.assertEqual(delivered.text, "second replay text")
+
+    async def test_hydrated_self_message_is_filtered(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._me_id = "bot-self"
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-self",
+            "senderId": "bot-self",
+            "blocks": [
+                {
+                    "content": {
+                        "case": "text",
+                        "value": {"content": "echo"},
+                    },
+                }
+            ],
+        })  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-self",
+                "messageId": "msg-self",
+                "status": "STATUS_COMPLETED",
+            },
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_non_user_group_message_role_is_not_dispatched(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-bot",
+                "messageId": "msg-bot",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_ASSISTANT",
+                "senderId": "assistant-1",
+                "summary": "assistant echo",
+            },
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_hydrated_non_user_group_message_role_is_not_dispatched(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-hydrated-bot",
+            "role": "ASSISTANT",
+            "senderId": "assistant-2",
+            "blocks": [
+                {
+                    "content": {
+                        "case": "text",
+                        "value": {"content": "hydrated assistant echo"},
+                    },
+                }
+            ],
+        })  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-hydrated-bot",
+                "messageId": "msg-hydrated-bot",
+                "status": "STATUS_COMPLETED",
+            },
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+
 class ConfigIntegrationTests(unittest.TestCase):
     """Platform enum + env-var pickup via gateway.config."""
 
@@ -389,6 +744,56 @@ class AuthorizationIntegrationTests(unittest.TestCase):
         text = run_py.read_text()
         self.assertIn('Platform.KIMI: "KIMI_ALLOWED_USERS"', text)
         self.assertIn('Platform.KIMI: "KIMI_ALLOW_ALL_USERS"', text)
+
+    def test_group_allowlist_accepts_raw_room_id(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(platforms={Platform.KIMI: PlatformConfig(enabled=True)})
+        runner.adapters = {Platform.KIMI: SimpleNamespace(send=AsyncMock())}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=Platform.KIMI,
+            user_id="kimi:user-1",
+            chat_id="room:chat-1",
+            user_name="tester",
+            chat_type="group",
+        )
+
+        with patch.dict(os.environ, {
+            "KIMI_GROUP_ALLOWED_USERS": "chat-1",
+            "KIMI_ALLOWED_USERS": "",
+            "GATEWAY_ALLOWED_USERS": "",
+            "GATEWAY_ALLOW_ALL_USERS": "",
+        }, clear=False):
+            self.assertTrue(runner._is_user_authorized(source))
+
+    def test_group_allowlist_accepts_prefixed_room_id(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(platforms={Platform.KIMI: PlatformConfig(enabled=True)})
+        runner.adapters = {Platform.KIMI: SimpleNamespace(send=AsyncMock())}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=Platform.KIMI,
+            user_id="kimi:user-1",
+            chat_id="room:chat-1",
+            user_name="tester",
+            chat_type="group",
+        )
+
+        with patch.dict(os.environ, {
+            "KIMI_GROUP_ALLOWED_USERS": "room:chat-1",
+            "KIMI_ALLOWED_USERS": "",
+            "GATEWAY_ALLOWED_USERS": "",
+            "GATEWAY_ALLOW_ALL_USERS": "",
+        }, clear=False):
+            self.assertTrue(runner._is_user_authorized(source))
 
 
 class UserIdentityExtractionTests(unittest.TestCase):
@@ -535,6 +940,22 @@ class DMInflightQueueTests(unittest.IsolatedAsyncioTestCase):
             "im:kimi:main", "reply", reply_to=None, metadata={}
         )
         self.assertTrue(result.success)
+
+    async def test_session_cancel_cancels_active_processing_and_clears_inflight(self):
+        adapter = KimiAdapter(_cfg())
+        sid = "im:kimi:main"
+        adapter._dm_inflight[sid] = deque([
+            _DMInflight(kimi_sid=sid, req_id=101),
+        ])
+        adapter.cancel_session_processing = AsyncMock()  # type: ignore
+
+        await adapter._dm_cancel_session(sid)
+
+        adapter.cancel_session_processing.assert_awaited_once()
+        self.assertNotIn(sid, adapter._dm_inflight)
+        kwargs = adapter.cancel_session_processing.await_args.kwargs
+        self.assertTrue(kwargs["release_guard"])
+        self.assertTrue(kwargs["discard_pending"])
 
 
 class WSUpgradeClassificationTests(unittest.IsolatedAsyncioTestCase):

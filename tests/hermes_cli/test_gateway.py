@@ -255,6 +255,34 @@ def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeyp
     assert calls == [(True, True, "alice")]
 
 
+def test_standard_platform_setup_uses_platform_allow_all_var(monkeypatch):
+    saved = []
+    monkeypatch.setattr(gateway, "get_env_value", lambda _name: "")
+    monkeypatch.setattr(gateway, "prompt", lambda *args, **kwargs: "")
+    monkeypatch.setattr(gateway, "prompt_choice", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(gateway, "save_env_value", lambda name, value: saved.append((name, value)))
+
+    gateway._setup_standard_platform({
+        "key": "kimi",
+        "label": "Kimi Claw",
+        "emoji": "🌙",
+        "token_var": "KIMI_BOT_TOKEN",
+        "allow_all_var": "KIMI_ALLOW_ALL_USERS",
+        "vars": [
+            {
+                "name": "KIMI_ALLOWED_USERS",
+                "prompt": "Allowed Kimi user IDs",
+                "password": False,
+                "is_allowlist": True,
+                "help": "Restrict Kimi users.",
+            },
+        ],
+    })
+
+    assert ("KIMI_ALLOW_ALL_USERS", "true") in saved
+    assert ("GATEWAY_ALLOW_ALL_USERS", "true") not in saved
+
+
 def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
     monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
     monkeypatch.setattr(gateway, "is_windows", lambda: False)

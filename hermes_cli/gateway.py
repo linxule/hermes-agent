@@ -2674,6 +2674,32 @@ _PLATFORMS = [
         "token_var": "WEIXIN_ACCOUNT_ID",
     },
     {
+        "key": "kimi",
+        "label": "Kimi Claw",
+        "emoji": "🌙",
+        "token_var": "KIMI_BOT_TOKEN",
+        "allow_all_var": "KIMI_ALLOW_ALL_USERS",
+        "setup_instructions": [
+            "1. In Kimi, choose Link existing OpenClaw to generate a bot token",
+            "2. Copy the km_b_prod_... bot token",
+            "3. Add the agent to Kimi group rooms if you want group chat",
+            "4. Use /sethome from a Kimi room, or set KIMI_HOME_CHANNEL=room:<room-id>",
+        ],
+        "vars": [
+            {"name": "KIMI_BOT_TOKEN", "prompt": "Kimi bot token", "password": True,
+             "help": "Paste the km_b_prod_... token from Kimi's OpenClaw linking flow."},
+            {"name": "KIMI_ALLOWED_USERS", "prompt": "Allowed Kimi user IDs (comma-separated, or empty)", "password": False,
+             "is_allowlist": True,
+             "help": "Restrict which Kimi users can interact with the bot. Leave empty only if you intend to use open access or pairing."},
+            {"name": "KIMI_HOME_CHANNEL", "prompt": "Home channel (room:<room-id> for cron delivery, or empty)", "password": False,
+             "help": "Kimi room ID for scheduled results and notifications. You can also set it later with /sethome."},
+            {"name": "KIMI_ENABLE_DMS", "prompt": "Enable Kimi DMs? (true/false, default: true)", "password": False,
+             "help": "Controls the Kimi direct-message WebSocket path."},
+            {"name": "KIMI_ENABLE_GROUPS", "prompt": "Enable Kimi groups? (true/false, default: true)", "password": False,
+             "help": "Controls the Kimi IM group subscription path."},
+        ],
+    },
+    {
         "key": "bluebubbles",
         "label": "BlueBubbles (iMessage)",
         "emoji": "💬",
@@ -2880,7 +2906,8 @@ def _setup_standard_platform(platform: dict):
                 ]
                 access_idx = prompt_choice("  How should unauthorized users be handled?", access_choices, 1)
                 if access_idx == 0:
-                    save_env_value("GATEWAY_ALLOW_ALL_USERS", "true")
+                    allow_all_var = platform.get("allow_all_var") or "GATEWAY_ALLOW_ALL_USERS"
+                    save_env_value(allow_all_var, "true")
                     print_warning("  Open access enabled — anyone can use your bot!")
                 elif access_idx == 1:
                     print_success("  DM pairing mode — users will receive a code to request access.")

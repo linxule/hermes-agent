@@ -3094,7 +3094,10 @@ class GatewayRunner:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
             }
-            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+            source_group_ids = {source.chat_id}
+            if source.platform == Platform.KIMI and source.chat_id.startswith("room:"):
+                source_group_ids.add(source.chat_id[len("room:"):])
+            if "*" in allowed_group_ids or (allowed_group_ids & source_group_ids):
                 return True
 
         # Check if user is in any allowlist

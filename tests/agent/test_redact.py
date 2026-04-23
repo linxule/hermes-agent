@@ -54,6 +54,13 @@ class TestKnownPrefixes:
         result = redact_sensitive_text("fal_abc123def456ghi789jkl")
         assert "abc123def456" not in result
 
+    def test_kimi_claw_bot_token(self):
+        token = "km_b_prod_abcdefghijklmnopqrstuvwxyz1234567890"
+        result = redact_sensitive_text(f"Using Kimi token {token}")
+        assert token not in result
+        assert "abcdefghijklmnopqrstuvwxyz" not in result
+        assert "..." in result
+
     def test_short_token_fully_masked(self):
         result = redact_sensitive_text("key=sk-short1234567")
         assert "***" in result

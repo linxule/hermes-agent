@@ -215,6 +215,14 @@ class TestToolsetConsistency:
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
 
+    def test_kimi_toolset_exposes_kimi_im_only_on_kimi(self):
+        assert "kimi_im" in TOOLSETS["hermes-kimi"]["tools"]
+        for name, ts in TOOLSETS.items():
+            if name == "hermes-kimi":
+                continue
+            if name.startswith("hermes-"):
+                assert "kimi_im" not in ts["tools"], f"{name} should not expose kimi_im"
+
 
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):
