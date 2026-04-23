@@ -205,6 +205,7 @@ def _handle_send(args):
         "signal": Platform.SIGNAL,
         "bluebubbles": Platform.BLUEBUBBLES,
         "qqbot": Platform.QQBOT,
+        "kimi": Platform.KIMI,
         "matrix": Platform.MATRIX,
         "mattermost": Platform.MATTERMOST,
         "homeassistant": Platform.HOMEASSISTANT,
@@ -571,6 +572,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.KIMI:
+            result = await _send_kimi(pconfig, chat_id, chunk, thread_id=thread_id)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1508,6 +1511,31 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_kimi(pconfig, chat_id, message, *, thread_id=None):
+    """Send via Kimi's Connect RPC unary SendMessage.
+
+    DMs (``dm:...`` chat_id prefix) require an active WS session held by the
+    gateway adapter — they cannot be delivered via this standalone path.
+    Group rooms (``room:<uuid>`` or ``room:<uuid>/<thread>``) work from any
+    context (cron jobs, tools, out-of-process scripts).
+    """
+    from gateway.platforms.kimi import send_kimi_message
+    result = await send_kimi_message(
+        pconfig,
+        chat_id,
+        message,
+        thread_id=thread_id,
+    )
+    if result.success:
+        return {
+            "success": True,
+            "platform": "kimi",
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+        }
+    return _error(f"Kimi send failed: {result.error}")
 
 
 # --- Registry ---

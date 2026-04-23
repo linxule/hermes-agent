@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    KIMI = "kimi"
 
 
 @dataclass
@@ -313,6 +314,9 @@ class GatewayConfig:
                 connected.append(platform)
             # QQBot uses extra dict for app credentials
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
+                connected.append(platform)
+            # Kimi uses a single bot token (same credential for DM WS + group Connect RPC)
+            elif platform == Platform.KIMI and config.token:
                 connected.append(platform)
             # DingTalk uses client_id/client_secret from config.extra or env vars
             elif platform == Platform.DINGTALK and (
@@ -1274,6 +1278,27 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.QQBOT,
                 chat_id=qq_home,
                 name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
+            )
+
+    # Kimi (kimi.com / Moonshot AI)
+    kimi_token = os.getenv("KIMI_BOT_TOKEN")
+    if kimi_token:
+        if Platform.KIMI not in config.platforms:
+            config.platforms[Platform.KIMI] = PlatformConfig()
+        config.platforms[Platform.KIMI].enabled = True
+        config.platforms[Platform.KIMI].token = kimi_token
+        kimi_extra = config.platforms[Platform.KIMI].extra
+        # Optional channel toggles via env (config.yaml takes precedence)
+        if "KIMI_ENABLE_DMS" in os.environ:
+            kimi_extra["enable_dms"] = os.environ["KIMI_ENABLE_DMS"].lower() in ("true", "1", "yes")
+        if "KIMI_ENABLE_GROUPS" in os.environ:
+            kimi_extra["enable_groups"] = os.environ["KIMI_ENABLE_GROUPS"].lower() in ("true", "1", "yes")
+        kimi_home = os.getenv("KIMI_HOME_CHANNEL", "").strip()
+        if kimi_home:
+            config.platforms[Platform.KIMI].home_channel = HomeChannel(
+                platform=Platform.KIMI,
+                chat_id=kimi_home,
+                name=os.getenv("KIMI_HOME_CHANNEL_NAME", "Home"),
             )
 
     # Session settings

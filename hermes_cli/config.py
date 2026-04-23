@@ -52,6 +52,9 @@ _EXTRA_ENV_KEYS = frozenset({
     "QQ_HOME_CHANNEL", "QQ_HOME_CHANNEL_NAME",  # legacy aliases (pre-rename, still read for back-compat)
     "QQ_ALLOWED_USERS", "QQ_GROUP_ALLOWED_USERS", "QQ_ALLOW_ALL_USERS", "QQ_MARKDOWN_SUPPORT",
     "QQ_STT_API_KEY", "QQ_STT_BASE_URL", "QQ_STT_MODEL",
+    "KIMI_BOT_TOKEN", "KIMI_HOME_CHANNEL", "KIMI_HOME_CHANNEL_NAME",
+    "KIMI_ALLOWED_USERS", "KIMI_GROUP_ALLOWED_USERS", "KIMI_ALLOW_ALL_USERS",
+    "KIMI_ENABLE_DMS", "KIMI_ENABLE_GROUPS",
     "TERMINAL_ENV", "TERMINAL_SSH_KEY", "TERMINAL_SSH_PORT",
     "WHATSAPP_MODE", "WHATSAPP_ENABLED",
     "MATTERMOST_HOME_CHANNEL", "MATTERMOST_REPLY_MODE",
@@ -1826,6 +1829,44 @@ OPTIONAL_ENV_VARS = {
         "description": "Enable QQ sandbox mode for development testing (true/false)",
         "prompt": "QQ Sandbox Mode",
         "category": "messaging",
+    },
+    "KIMI_BOT_TOKEN": {
+        "description": "Kimi (kimi.com) bot token, obtained from 'Link existing OpenClaw' flow. Shape: km_b_prod_...",
+        "prompt": "Kimi Bot Token",
+        "category": "messaging",
+        "password": True,
+    },
+    "KIMI_HOME_CHANNEL": {
+        "description": "Default Kimi chat for cron delivery (format: 'dm:im:kimi:main' or 'room:<uuid>')",
+        "prompt": "Kimi Home Channel",
+        "category": "messaging",
+    },
+    "KIMI_HOME_CHANNEL_NAME": {
+        "description": "Display name for the Kimi home channel",
+        "prompt": "Kimi Home Channel Name",
+        "category": "messaging",
+    },
+    "KIMI_ALLOWED_USERS": {
+        "description": "Comma-separated Kimi DM user ids allowed to interact (leave empty + KIMI_ALLOW_ALL_USERS=true to allow any)",
+        "prompt": "Kimi Allowed Users",
+        "category": "messaging",
+    },
+    "KIMI_ALLOW_ALL_USERS": {
+        "description": "Allow all Kimi users without an allowlist (true/false). Kimi's bot token is per-user so normally safe.",
+        "prompt": "Allow All Kimi Users",
+        "category": "messaging",
+    },
+    "KIMI_ENABLE_DMS": {
+        "description": "Enable Kimi DM channel via ACP WebSocket (true/false, default true)",
+        "prompt": "Enable Kimi DMs",
+        "category": "messaging",
+        "advanced": True,
+    },
+    "KIMI_ENABLE_GROUPS": {
+        "description": "Enable Kimi group-room channel via Connect RPC Subscribe (true/false, default true)",
+        "prompt": "Enable Kimi Groups",
+        "category": "messaging",
+        "advanced": True,
     },
     "GATEWAY_ALLOW_ALL_USERS": {
         "description": "Allow all users to interact with messaging bots (true/false). Default: false.",

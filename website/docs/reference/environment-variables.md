@@ -314,6 +314,14 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `QQBOT_HOME_CHANNEL` | QQ user/group openID for cron delivery and notifications |
 | `QQBOT_HOME_CHANNEL_NAME` | Display name for the QQ home channel |
 | `QQ_SANDBOX` | Route QQ Bot to the sandbox gateway for development testing (`true`/`false`). Use with a sandbox app credential from [q.qq.com](https://q.qq.com). |
+| `KIMI_BOT_TOKEN` | Kimi bot token (`km_b_prod_...`) from kimi.com's "Link existing OpenClaw" flow |
+| `KIMI_ALLOWED_USERS` | Comma-separated Kimi user IDs allowed to DM the bot |
+| `KIMI_GROUP_ALLOWED_USERS` | Comma-separated Kimi user IDs allowed to interact in group rooms |
+| `KIMI_ALLOW_ALL_USERS` | Allow all Kimi users (`true`/`false`). Safe for personal bots — bot token is per-user. |
+| `KIMI_HOME_CHANNEL` | Default Kimi chat for cron delivery. Format: `dm:im:kimi:main` or `room:<uuid>`. |
+| `KIMI_HOME_CHANNEL_NAME` | Display name for the Kimi home channel |
+| `KIMI_ENABLE_DMS` | Enable Kimi DM channel (ACP WebSocket) (`true`/`false`, default `true`) |
+| `KIMI_ENABLE_GROUPS` | Enable Kimi group-room channel (Connect RPC Subscribe) (`true`/`false`, default `true`) |
 | `MATTERMOST_URL` | Mattermost server URL (e.g. `https://mm.example.com`) |
 | `MATTERMOST_TOKEN` | Bot token or personal access token for Mattermost |
 | `MATTERMOST_ALLOWED_USERS` | Comma-separated Mattermost user IDs allowed to message the bot |
