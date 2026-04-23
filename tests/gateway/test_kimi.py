@@ -1428,6 +1428,158 @@ class DMInflightQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kwargs["discard_pending"])
 
 
+class DMPromptCounterTests(unittest.IsolatedAsyncioTestCase):
+    """DM session/prompt traffic counter increments on real prompts only."""
+
+    async def test_dm_prompt_counter_increments_on_prompt(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.handle_message = AsyncMock()  # type: ignore
+        self.assertEqual(adapter._dm_prompt_count, 0)
+
+        # Minimal session/prompt frame shape — one text block.
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "im:kimi:main",
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        }
+        await adapter._dm_on_inbound_frame(frame)
+
+        self.assertEqual(adapter._dm_prompt_count, 1)
+        adapter.handle_message.assert_awaited_once()
+
+        # Two more — counter accumulates.
+        await adapter._dm_on_inbound_frame(frame)
+        await adapter._dm_on_inbound_frame(frame)
+        self.assertEqual(adapter._dm_prompt_count, 3)
+
+    async def test_dm_prompt_counter_unchanged_on_non_prompt(self):
+        """$/ping, initialize, session/new etc. are not user prompts."""
+        adapter = KimiAdapter(_cfg())
+        adapter._dm_respond = AsyncMock()  # type: ignore
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._dm_on_inbound_frame({
+            "jsonrpc": "2.0", "method": "$/ping", "params": {},
+        })
+        await adapter._dm_on_inbound_frame({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+        })
+        await adapter._dm_on_inbound_frame({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {},
+        })
+        # Frame with no text block — the prompt branch runs but returns early,
+        # so we DO NOT count it as a real prompt.
+        await adapter._dm_on_inbound_frame({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": "im:kimi:main", "prompt": []},
+        })
+
+        self.assertEqual(adapter._dm_prompt_count, 0)
+
+    async def test_dm_prompt_counter_does_not_count_empty_prompt(self):
+        """Empty / malformed session/prompt frames short-circuit before counting."""
+        adapter = KimiAdapter(_cfg())
+        adapter._dm_respond = AsyncMock()  # type: ignore
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        await adapter._dm_on_inbound_frame({
+            "jsonrpc": "2.0", "id": 7, "method": "session/prompt",
+            "params": {"sessionId": "im:kimi:main"},
+        })
+        self.assertEqual(adapter._dm_prompt_count, 0)
+        adapter.handle_message.assert_not_awaited()
+
+
+class DMHealthSummaryTests(unittest.IsolatedAsyncioTestCase):
+    """One-shot DM traffic tripwire at _dm_health_summary_s."""
+
+    async def test_dm_health_summary_warns_on_zero_traffic(self):
+        adapter = KimiAdapter(_cfg(dm_health_summary_s=0.01))
+        self.assertEqual(adapter._dm_prompt_count, 0)
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.WARNING) as cm:
+            await adapter._log_dm_health_summary()
+
+        warnings = [r for r in cm.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        msg = warnings[0].getMessage()
+        self.assertIn("zero prompts", msg)
+        self.assertIn("enable_dms", msg)
+
+    async def test_dm_health_summary_info_on_traffic(self):
+        adapter = KimiAdapter(_cfg(dm_health_summary_s=0.01))
+        adapter._dm_prompt_count = 7
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.INFO) as cm:
+            await adapter._log_dm_health_summary()
+
+        info = [r for r in cm.records if r.levelno == logging.INFO]
+        warnings = [r for r in cm.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 0)
+        self.assertTrue(any("received 7 prompts" in r.getMessage() for r in info))
+
+    async def test_dm_health_summary_cancellation_safe(self):
+        """Cancelling the task before the delay elapses logs nothing.
+
+        The coroutine catches CancelledError internally so the task finishes
+        cleanly (no unhandled exception noise in logs) — we assert no
+        summary record was emitted and the task result is consumed.
+        """
+        adapter = KimiAdapter(_cfg(dm_health_summary_s=60))  # long delay
+
+        # Collect any records that fire during the task's lifetime.
+        captured: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = captured.append  # type: ignore[assignment]
+        kimi_logger = logging.getLogger("gateway.platforms.kimi")
+        kimi_logger.addHandler(handler)
+        try:
+            task = asyncio.create_task(adapter._log_dm_health_summary())
+            await asyncio.sleep(0)  # give it a chance to enter sleep()
+            task.cancel()
+            # The coroutine swallows CancelledError internally, so it
+            # returns normally (and awaiting it produces None).
+            await task
+        finally:
+            kimi_logger.removeHandler(handler)
+        health_records = [
+            r for r in captured
+            if "prompts in first hour" in r.getMessage()
+            or "zero prompts in first hour" in r.getMessage()
+        ]
+        self.assertEqual(health_records, [])
+
+    async def test_dm_health_summary_disabled_by_zero_setting(self):
+        """dm_health_summary_s=0 skips arming the task in connect()."""
+        adapter = KimiAdapter(_cfg(dm_health_summary_s=0))
+        self.assertEqual(adapter._dm_health_summary_s, 0)
+        # Task is only created inside connect() — this verifies the knob is
+        # read and typed correctly. Lifecycle scheduling is covered indirectly
+        # by the cancellation test above.
+
+
+class SessionKeyConfigHoistingTests(unittest.TestCase):
+    """session_key_* config reads live in __init__, not the hot cancel path."""
+
+    def test_session_key_attributes_hoisted_from_config(self):
+        adapter = KimiAdapter(_cfg(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=True,
+        ))
+        self.assertFalse(adapter._group_sessions_per_user)
+        self.assertTrue(adapter._thread_sessions_per_user)
+
+    def test_session_key_attributes_defaults(self):
+        adapter = KimiAdapter(_cfg())
+        # Defaults match prior behavior (see _dm_cancel_session before hoist).
+        self.assertTrue(adapter._group_sessions_per_user)
+        self.assertFalse(adapter._thread_sessions_per_user)
+
+
 class WSUpgradeClassificationTests(unittest.IsolatedAsyncioTestCase):
     """_dm_ws_connect_once special-cases 401/403/409 (C2)."""
 

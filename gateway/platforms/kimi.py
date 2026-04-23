@@ -145,6 +145,14 @@ _RECONNECT_MAX_S_DEFAULT = 60.0
 # MUST be ignored by peers that don't recognize them.
 _DM_APP_KEEPALIVE_S_DEFAULT = 25.0
 
+# DM health tripwire: after this many seconds since first connect, log a
+# one-shot summary of DM prompt traffic. In live testing, Kimi routes what
+# users call "DMs" through the group Subscribe stream as room:<uuid>; the
+# ACP WS connects and keepalives but never receives session/prompt frames.
+# Zero traffic after an hour flags that the ACP WS path may be dead weight
+# — the operator can toggle config.extra.enable_dms=false to drop it.
+_DM_HEALTH_SUMMARY_S_DEFAULT = 3600.0
+
 # Dedup ring buffer size — covers Kimi's replay window on Subscribe reconnect.
 _DEDUP_MAXLEN = 2000
 
@@ -844,14 +852,35 @@ class KimiAdapter(BasePlatformAdapter):
             config.extra.get("dm_app_keepalive_s", _DM_APP_KEEPALIVE_S_DEFAULT)
         )
         self._startup_grace_s: float = float(config.extra.get("startup_grace_s", 30))
+        self._dm_health_summary_s: float = float(
+            config.extra.get("dm_health_summary_s", _DM_HEALTH_SUMMARY_S_DEFAULT)
+        )
+
+        # Session-key knobs hoisted out of the _dm_cancel_session hot path.
+        # These are semantically config flags — read once at __init__ so the
+        # session-cancel call site stays a straight function call, matching
+        # the pattern used by `_group_require_mention` et al.
+        self._group_sessions_per_user: bool = bool(
+            config.extra.get("group_sessions_per_user", True)
+        )
+        self._thread_sessions_per_user: bool = bool(
+            config.extra.get("thread_sessions_per_user", False)
+        )
 
         # Runtime state
         self._closing: bool = False
         self._startup_ts: float = 0.0
         self._dm_task: Optional[asyncio.Task] = None
         self._group_task: Optional[asyncio.Task] = None
+        self._dm_health_task: Optional[asyncio.Task] = None
         self._http_session: Optional[Any] = None  # aiohttp.ClientSession
         self._ws: Optional[Any] = None  # active DM WS
+
+        # DM traffic observability — count successfully dispatched
+        # session/prompt frames. A one-shot summary fires
+        # `_dm_health_summary_s` after connect() to flag zero-traffic DMs
+        # (Kimi routing DMs via the group Subscribe path instead of ACP).
+        self._dm_prompt_count: int = 0
 
         # Bot identity (populated by GetMe on connect)
         self._me_id: Optional[str] = None
@@ -926,6 +955,13 @@ class KimiAdapter(BasePlatformAdapter):
 
         if self._enable_dms:
             self._dm_task = asyncio.create_task(self._dm_ws_loop(), name="kimi-dm")
+            # Arm the one-shot DM health tripwire in parallel. If disconnect()
+            # fires before _dm_health_summary_s elapses, the task is cancelled
+            # cleanly and never logs.
+            if self._dm_health_summary_s > 0:
+                self._dm_health_task = asyncio.create_task(
+                    self._log_dm_health_summary(), name="kimi-dm-health",
+                )
         if self._enable_groups:
             self._group_task = asyncio.create_task(
                 self._group_subscribe_loop(), name="kimi-group"
@@ -945,11 +981,15 @@ class KimiAdapter(BasePlatformAdapter):
         self._closing = True
         self._mark_disconnected()
 
-        tasks = [t for t in (self._dm_task, self._group_task) if t is not None]
+        tasks = [
+            t for t in (self._dm_task, self._group_task, self._dm_health_task)
+            if t is not None
+        ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._dm_health_task = None
 
         if self._ws is not None:
             try:
@@ -1285,6 +1325,37 @@ class KimiAdapter(BasePlatformAdapter):
     # DM WebSocket loop
     # ──────────────────────────────────────────────────────────────────────
 
+    async def _log_dm_health_summary(self) -> None:
+        """One-shot observability tripwire for the DM ACP WS path.
+
+        After ``_dm_health_summary_s`` elapses since ``connect()``, log an
+        INFO summary of DM prompts processed. If the count is zero, log at
+        WARNING — Kimi may be routing what users call "DMs" through the
+        group Subscribe stream (we've seen this live) and the ACP WS path
+        is effectively dead weight that can be disabled via
+        ``config.extra.enable_dms = false``.
+
+        Cancellation-safe: if the adapter disconnects before the delay
+        elapses, the sleep raises ``CancelledError`` and we exit without
+        logging anything. No recurrence — this is a tripwire, not a
+        heartbeat.
+        """
+        try:
+            await asyncio.sleep(self._dm_health_summary_s)
+        except asyncio.CancelledError:
+            return
+        count = self._dm_prompt_count
+        if count > 0:
+            logger.info(
+                "Kimi DM: received %d prompts in first hour", count,
+            )
+        else:
+            logger.warning(
+                "Kimi DM: zero prompts in first hour since connect — Kimi "
+                "may be routing DMs via group Subscribe. Consider "
+                "config.extra.enable_dms: false to disable ACP path.",
+            )
+
     async def _dm_ws_loop(self) -> None:
         """Maintain the DM ACP WebSocket with exponential reconnect backoff."""
         backoff = _RECONNECT_MIN_S
@@ -1569,6 +1640,10 @@ class KimiAdapter(BasePlatformAdapter):
             user_name=user_name,
             raw=msg,
         )
+        # Count before dispatch — semantically "the adapter processed one
+        # session/prompt frame from Kimi's WS". Not conditional on handler
+        # success; the signal we care about is Kimi-side routing behaviour.
+        self._dm_prompt_count += 1
         await self.handle_message(event)
 
     async def _dm_cancel_session(self, kimi_sid: Optional[str]) -> None:
@@ -1584,8 +1659,8 @@ class KimiAdapter(BasePlatformAdapter):
         )
         session_key = build_session_key(
             source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=self._group_sessions_per_user,
+            thread_sessions_per_user=self._thread_sessions_per_user,
         )
         await self.cancel_session_processing(
             session_key,
