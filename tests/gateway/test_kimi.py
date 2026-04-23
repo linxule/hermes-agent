@@ -12,6 +12,7 @@ import json
 import os
 import struct
 import unittest
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform, PlatformConfig
@@ -19,15 +20,25 @@ from gateway.platforms.base import MessageType, SendResult
 from gateway.platforms.kimi import (
     _CONNECT_FLAG_COMPRESSED,
     _CONNECT_FLAG_END_STREAM,
+    _DMInflight,
+    _WS_MAX_FRAME_SIZE,
     KimiAdapter,
     KimiAuthError,
     KimiProtocolError,
     KimiRpcError,
+    _extract_user_identity,
     _is_standalone_slash_command,
     _parse_iso8601,
     _split_for_streaming,
     check_kimi_requirements,
 )
+
+
+class _FakeWSStatusError(Exception):
+    """Mimic websockets 12+ upgrade-rejection exception shape."""
+    def __init__(self, status: int):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
 
 
 def _cfg(**extra) -> PlatformConfig:
@@ -377,6 +388,193 @@ class AuthorizationIntegrationTests(unittest.TestCase):
         text = run_py.read_text()
         self.assertIn('Platform.KIMI: "KIMI_ALLOWED_USERS"', text)
         self.assertIn('Platform.KIMI: "KIMI_ALLOW_ALL_USERS"', text)
+
+
+class UserIdentityExtractionTests(unittest.TestCase):
+    """_extract_user_identity probes several plausible Kimi wire shapes."""
+
+    def test_flat_userid(self):
+        uid, name = _extract_user_identity({"userId": "u-123"})
+        self.assertEqual(uid, "u-123")
+        self.assertIsNone(name)
+
+    def test_flat_user_id_snake(self):
+        uid, _ = _extract_user_identity({"user_id": "u-456"})
+        self.assertEqual(uid, "u-456")
+
+    def test_nested_sender(self):
+        uid, name = _extract_user_identity(
+            {"sender": {"id": "u-789", "name": "Alice"}}
+        )
+        self.assertEqual(uid, "u-789")
+        self.assertEqual(name, "Alice")
+
+    def test_nested_user_with_display_name(self):
+        uid, name = _extract_user_identity(
+            {"user": {"userId": "u-abc", "display_name": "Bob"}}
+        )
+        self.assertEqual(uid, "u-abc")
+        self.assertEqual(name, "Bob")
+
+    def test_no_identity(self):
+        uid, name = _extract_user_identity({"sessionId": "im:kimi:main"})
+        self.assertIsNone(uid)
+        self.assertIsNone(name)
+
+    def test_non_dict_input(self):
+        uid, name = _extract_user_identity(None)
+        self.assertIsNone(uid)
+        self.assertIsNone(name)
+        uid, name = _extract_user_identity("string")
+        self.assertIsNone(uid)
+        self.assertIsNone(name)
+
+
+class EnvelopeLengthCapTests(unittest.IsolatedAsyncioTestCase):
+    """Connect envelope parser refuses oversize frames (I4 DoS guard)."""
+
+    async def test_envelope_length_cap_rejects_oversize(self):
+        adapter = KimiAdapter(_cfg())
+        oversize = _WS_MAX_FRAME_SIZE + 1
+        header = bytes([0x00]) + struct.pack(">I", oversize)
+        reader = MagicMock()
+        reader.readexactly = AsyncMock(return_value=header)
+        with self.assertRaises(KimiProtocolError) as ctx:
+            async for _ in adapter._connect_envelope_parser(reader):
+                self.fail("should not yield")
+        self.assertIn("exceeds max frame size", str(ctx.exception))
+
+    async def test_envelope_length_at_cap_is_allowed(self):
+        adapter = KimiAdapter(_cfg())
+        body = b'{"ping":{}}'
+        header = bytes([0x00]) + struct.pack(">I", len(body))
+        reads = [header, body, b""]
+        reader = MagicMock()
+
+        async def _readexactly(n):
+            if not reads:
+                raise asyncio.IncompleteReadError(b"", n)
+            chunk = reads.pop(0)
+            if len(chunk) != n:
+                # Simulate end-of-stream for the empty tail read
+                raise asyncio.IncompleteReadError(chunk, n)
+            return chunk
+
+        reader.readexactly = _readexactly
+        yielded = []
+        with self.assertRaises(Exception):
+            async for msg in adapter._connect_envelope_parser(reader):
+                yielded.append(msg)
+        self.assertEqual(yielded, [{"ping": {}}])
+
+
+class DMInflightQueueTests(unittest.IsolatedAsyncioTestCase):
+    """Overlapping DM prompts get FIFO end_turn responses (I2)."""
+
+    async def test_send_dm_pops_oldest_inflight(self):
+        adapter = KimiAdapter(_cfg())
+        # Simulate two in-flight prompts on the same kimi_sid
+        sid = "im:kimi:main"
+        adapter._dm_inflight[sid] = deque([
+            _DMInflight(kimi_sid=sid, req_id=101),
+            _DMInflight(kimi_sid=sid, req_id=102),
+        ])
+
+        respond_mock = AsyncMock()
+        adapter._dm_respond = respond_mock  # type: ignore
+        adapter._dm_emit_chunk = AsyncMock()  # type: ignore
+        adapter._ws = MagicMock()  # non-None sentinel
+
+        # First reply should pop req_id=101
+        await adapter._send_dm(sid, "reply one", reply_to=None, metadata={})
+        self.assertEqual(respond_mock.await_args_list[0].args[0], 101)
+
+        # Second reply should pop req_id=102 and leave the queue empty
+        await adapter._send_dm(sid, "reply two", reply_to=None, metadata={})
+        self.assertEqual(respond_mock.await_args_list[1].args[0], 102)
+        self.assertNotIn(sid, adapter._dm_inflight)
+
+    async def test_send_dm_no_inflight_is_harmless(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._dm_respond = AsyncMock()  # type: ignore
+        adapter._dm_emit_chunk = AsyncMock()  # type: ignore
+        adapter._ws = MagicMock()
+        result = await adapter._send_dm(
+            "im:kimi:main", "reply", reply_to=None, metadata={}
+        )
+        self.assertTrue(result.success)
+
+
+class WSUpgradeClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """_dm_ws_connect_once special-cases 401/403/409 (C2)."""
+
+    async def test_403_returns_permanent(self):
+        adapter = KimiAdapter(_cfg())
+        with patch(
+            "gateway.platforms.kimi.websockets.connect",
+            side_effect=_FakeWSStatusError(403),
+        ):
+            rc = await adapter._dm_ws_connect_once()
+        self.assertEqual(rc, 3)
+
+    async def test_409_first_strike_cools_off_60s(self):
+        adapter = KimiAdapter(_cfg())
+        sleep_mock = AsyncMock()
+        with patch(
+            "gateway.platforms.kimi.websockets.connect",
+            side_effect=_FakeWSStatusError(409),
+        ), patch("gateway.platforms.kimi.asyncio.sleep", sleep_mock):
+            rc = await adapter._dm_ws_connect_once()
+        self.assertEqual(rc, 0)
+        self.assertEqual(adapter._dm_409_strikes, 1)
+        sleep_mock.assert_awaited_once_with(60.0)
+
+    async def test_409_second_strike_cools_off_300s(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._dm_409_strikes = 1  # prior strike
+        sleep_mock = AsyncMock()
+        with patch(
+            "gateway.platforms.kimi.websockets.connect",
+            side_effect=_FakeWSStatusError(409),
+        ), patch("gateway.platforms.kimi.asyncio.sleep", sleep_mock):
+            rc = await adapter._dm_ws_connect_once()
+        self.assertEqual(rc, 0)
+        self.assertEqual(adapter._dm_409_strikes, 2)
+        sleep_mock.assert_awaited_once_with(300.0)
+
+    async def test_401_returns_permanent(self):
+        adapter = KimiAdapter(_cfg())
+        with patch(
+            "gateway.platforms.kimi.websockets.connect",
+            side_effect=_FakeWSStatusError(401),
+        ):
+            rc = await adapter._dm_ws_connect_once()
+        self.assertEqual(rc, 3)
+
+
+class LifecycleStatusTests(unittest.IsolatedAsyncioTestCase):
+    """connect/disconnect drive base-class status + permanent auth sets fatal."""
+
+    async def test_permanent_auth_triggers_fatal_error(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._dm_ws_connect_once = AsyncMock(return_value=3)  # type: ignore
+        await adapter._dm_ws_loop()
+        self.assertEqual(adapter._fatal_error_code, "kimi_dm_auth")
+        self.assertFalse(adapter._fatal_error_retryable)
+
+    async def test_closing_shutdown_does_not_set_fatal(self):
+        """If _closing is already True (clean shutdown path), don't leak fatal."""
+        adapter = KimiAdapter(_cfg())
+        adapter._closing = True
+        adapter._dm_ws_connect_once = AsyncMock(return_value=3)  # type: ignore
+        await adapter._dm_ws_loop()
+        self.assertIsNone(adapter._fatal_error_code)
+
+    async def test_groups_permanent_auth_triggers_fatal_error(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._group_subscribe_once = AsyncMock(return_value=3)  # type: ignore
+        await adapter._group_subscribe_loop()
+        self.assertEqual(adapter._fatal_error_code, "kimi_groups_auth")
 
 
 if __name__ == "__main__":

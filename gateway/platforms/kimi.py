@@ -202,6 +202,37 @@ def _first_text_block(params: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_user_identity(params: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort extract ``(user_id, user_name)`` from an ACP session/prompt.
+
+    Kimi's wire format for DM user identity isn't publicly documented. We
+    probe several plausible shapes without failing if none are present:
+
+      - ``params["sender"]`` / ``params["user"]`` / ``params["author"]``:
+        nested dicts with ``id`` / ``userId`` / ``name``
+      - ``params["userId"]`` / ``params["user_id"]`` (flat)
+
+    Returns ``(None, None)`` if no identity can be extracted; caller must
+    fall back to a session-derived id and log the multi-user collapse
+    limitation.
+    """
+    if not isinstance(params, dict):
+        return None, None
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    for key in ("sender", "user", "author"):
+        obj = params.get(key)
+        if isinstance(obj, dict):
+            user_id = user_id or (
+                obj.get("id") or obj.get("userId") or obj.get("user_id")
+            )
+            user_name = user_name or (
+                obj.get("name") or obj.get("display_name") or obj.get("displayName")
+            )
+    user_id = user_id or params.get("userId") or params.get("user_id")
+    return user_id, user_name
+
+
 def _split_for_streaming(text: str, chunk_size: int) -> List[str]:
     """Split ``text`` for progressive DM streaming.
 
@@ -356,10 +387,17 @@ class KimiAdapter(BasePlatformAdapter):
         # DM state
         # ACP synthetic session id (we generate; Kimi treats it as opaque)
         self._dm_fake_session_id: Optional[str] = None
-        # In-flight DM prompts: maps (kimi_sid) -> _DMInflight for req_id matching
-        self._dm_inflight: Dict[str, _DMInflight] = {}
+        # In-flight DM prompts per sid (FIFO). Overlapping prompts are queued
+        # so end_turn responses match their originating req_id in order.
+        self._dm_inflight: Dict[str, "deque[_DMInflight]"] = {}
         # Kimi's actual sessionId parameter, observed from inbound frames
         self._dm_observed_kimi_sid: Optional[str] = None
+        # 409 "bot already connected" strike count — resets on successful connect.
+        # First strike sleeps 60s, subsequent strikes 300s to let Kimi's server-
+        # side routing clear any ghost WS state from prior thrash cycles.
+        self._dm_409_strikes: int = 0
+        # One-shot warning guard for the multi-user DM collapse limitation.
+        self._warned_dm_collapse: bool = False
 
         # Dedup of inbound events (keyed by (source_tag, message_id))
         self._processed: deque = deque(maxlen=_DEDUP_MAXLEN)
@@ -419,13 +457,13 @@ class KimiAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
 
-        self._running = True
+        self._mark_connected()
         return True
 
     async def disconnect(self) -> None:
         """Cancel both loops, close WS + HTTP session."""
         self._closing = True
-        self._running = False
+        self._mark_disconnected()
 
         tasks = [t for t in (self._dm_task, self._group_task) if t is not None]
         for task in tasks:
@@ -573,9 +611,15 @@ class KimiAdapter(BasePlatformAdapter):
         while not self._closing:
             rc = await self._dm_ws_connect_once()
             if self._closing or rc == 3:
-                # Permanent auth failure — stop trying.
-                if rc == 3:
+                # Permanent auth failure — surface it via runtime status so the
+                # gateway supervisor can stop retrying and alert the operator.
+                if rc == 3 and not self._closing:
                     logger.error("Kimi DM: permanent auth failure, stopping loop")
+                    self._set_fatal_error(
+                        "kimi_dm_auth",
+                        "Kimi DM WebSocket permanent auth failure",
+                        retryable=False,
+                    )
                 return
             if rc == 1:
                 # Other terminal error — stop trying but don't claim auth.
@@ -612,6 +656,8 @@ class KimiAdapter(BasePlatformAdapter):
                 self._dm_fake_session_id = None
                 self._dm_observed_kimi_sid = None
                 self._dm_inflight.clear()
+                # Successful upgrade — clear any accumulated 409 cooldown strikes.
+                self._dm_409_strikes = 0
                 keepalive_task = asyncio.create_task(
                     self._dm_app_keepalive(ws), name="kimi-dm-keepalive"
                 )
@@ -631,8 +677,15 @@ class KimiAdapter(BasePlatformAdapter):
                     keepalive_task.cancel()
                     try:
                         await keepalive_task
-                    except (asyncio.CancelledError, Exception):
+                    except asyncio.CancelledError:
+                        # Expected — we just cancelled the keepalive. Outer-scope
+                        # cancellation will propagate via the next await point.
                         pass
+                    except Exception:
+                        logger.debug(
+                            "Kimi DM: keepalive task ended with exception",
+                            exc_info=True,
+                        )
                     self._ws = None
             return 0
         except ConnectionClosed as exc:
@@ -651,6 +704,27 @@ class KimiAdapter(BasePlatformAdapter):
             if status == 401:
                 logger.error("Kimi DM: WS upgrade 401 — bot token rejected")
                 return 3
+            if status == 403:
+                logger.error("Kimi DM: WS upgrade 403 — bot forbidden")
+                return 3
+            if status == 409:
+                # "Bot already connected" — Kimi's single-WS-per-token constraint.
+                # Using the default 2s→60s exponential here produces reconnect
+                # thrash that Kimi's routing layer can interpret as misbehavior
+                # and silently throttle DM delivery to this bot for hours. Hard
+                # cooldown so any ghost WS on the server side ages out first.
+                self._dm_409_strikes += 1
+                cooldown = 60.0 if self._dm_409_strikes == 1 else 300.0
+                logger.warning(
+                    "Kimi DM: WS upgrade 409 (ghost WS, strike %d) — cooling "
+                    "off %.0fs before retry",
+                    self._dm_409_strikes, cooldown,
+                )
+                try:
+                    await asyncio.sleep(cooldown)
+                except asyncio.CancelledError:
+                    return 1
+                return 0
             logger.warning("Kimi DM: connection error: %r", exc)
             return 0
 
@@ -779,8 +853,29 @@ class KimiAdapter(BasePlatformAdapter):
         chat_id = f"{_CHATID_DM_PREFIX}{kimi_sid}"
         message_id = str(req_id) if req_id is not None else f"dm-{uuid.uuid4().hex[:12]}"
 
-        # Track req_id so _send_dm can close the round-trip with end_turn.
-        self._dm_inflight[kimi_sid] = _DMInflight(kimi_sid=kimi_sid, req_id=req_id)
+        # Queue req_id so overlapping prompts get FIFO end_turn responses
+        # instead of clobbering a previous in-flight (which would leave the
+        # original prompt's Kimi UI spinner hanging forever).
+        self._dm_inflight.setdefault(kimi_sid, deque()).append(
+            _DMInflight(kimi_sid=kimi_sid, req_id=req_id)
+        )
+
+        # Best-effort extract a per-user identity so multi-user bots route
+        # DMs to per-user sessions rather than collapsing everyone into one.
+        # Kimi's wire format isn't publicly documented; we fall back to
+        # sessionId-derived identity + a one-shot warning log if nothing was
+        # provided.
+        user_id, user_name = _extract_user_identity(params)
+        if not user_id:
+            if not self._warned_dm_collapse:
+                logger.warning(
+                    "Kimi DM: session/prompt carries no user identity — "
+                    "multi-user bots on this adapter will collapse all DM "
+                    "users into a single Hermes session. Sending will still "
+                    "work; session state won't be isolated per user."
+                )
+                self._warned_dm_collapse = True
+            user_id = f"kimi:dm:{kimi_sid}"
 
         event = self._build_message_event(
             kind="dm",
@@ -788,8 +883,8 @@ class KimiAdapter(BasePlatformAdapter):
             message_id=message_id,
             chat_id=chat_id,
             chat_name="Kimi DM",
-            user_id="kimi:dm:user",
-            user_name=None,
+            user_id=user_id,
+            user_name=user_name,
             raw=msg,
         )
         await self.handle_message(event)
@@ -858,8 +953,14 @@ class KimiAdapter(BasePlatformAdapter):
         for chunk in chunks:
             await self._dm_emit_chunk(kimi_sid, chunk)
 
-        # Close the round-trip for whatever prompt originated this reply.
-        inflight = self._dm_inflight.pop(kimi_sid, None)
+        # Pop the oldest in-flight prompt for this sid (FIFO) and close its
+        # round-trip. If the queue empties, drop the mapping.
+        queue = self._dm_inflight.get(kimi_sid)
+        inflight: Optional[_DMInflight] = None
+        if queue:
+            inflight = queue.popleft()
+            if not queue:
+                self._dm_inflight.pop(kimi_sid, None)
         if inflight is not None and inflight.req_id is not None:
             await self._dm_respond(inflight.req_id, {"stopReason": "end_turn"})
 
@@ -878,8 +979,13 @@ class KimiAdapter(BasePlatformAdapter):
         while not self._closing:
             rc = await self._group_subscribe_once()
             if self._closing or rc == 3:
-                if rc == 3:
+                if rc == 3 and not self._closing:
                     logger.error("Kimi groups: permanent auth failure, stopping loop")
+                    self._set_fatal_error(
+                        "kimi_groups_auth",
+                        "Kimi Subscribe stream permanent auth failure",
+                        retryable=False,
+                    )
                 return
             if rc == 1:
                 logger.error("Kimi groups: terminal error, stopping loop")
@@ -1160,6 +1266,14 @@ class KimiAdapter(BasePlatformAdapter):
 
             flag = header[0]
             length = struct.unpack(">I", header[1:5])[0]
+            # Defensive cap: the length prefix is 4 bytes big-endian (up to
+            # 4 GB). An unbounded readexactly here would OOM on a hostile or
+            # buggy upstream. Mirror the WS max-frame cap.
+            if length > _WS_MAX_FRAME_SIZE:
+                raise KimiProtocolError(
+                    f"envelope length {length} exceeds max frame size "
+                    f"{_WS_MAX_FRAME_SIZE}"
+                )
             payload = b""
             if length:
                 try:

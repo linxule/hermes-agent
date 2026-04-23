@@ -98,11 +98,23 @@ To participate in group rooms, Kimi requires certain `X-Kimi-OpenClaw-*` runtime
 
 **DM WebSocket closes with code 4001.** The bot token was revoked or rotated. Regenerate via Kimi's "Link existing OpenClaw" flow and restart the gateway.
 
+**DM WebSocket upgrade returns HTTP 409 ("bot already connected").** Kimi enforces a single live WebSocket per bot token. If a previous gateway instance didn't cleanly close its socket (crash, kill -9, network disconnect mid-session), Kimi's server may briefly hold a "ghost" WS and reject new upgrades with 409. The adapter handles this by backing off for 60s on the first strike and 300s on subsequent strikes, rather than retrying the default 2s → 60s exponential — rapid reconnect attempts after a 409 can cause Kimi's routing layer to silently throttle inbound DM delivery to the bot for an extended period. Wait for the cooldown; don't manually restart the gateway during it. A successful connect resets the strike counter.
+
+**DM WebSocket upgrade returns HTTP 403.** The bot token is valid but the account lacks permission to open the bot WebSocket surface. Treated as permanent — the adapter stops retrying DMs and surfaces a fatal status. Check your Kimi account's bot permissions.
+
 **Group messages never arrive even though the bot is in the room.** The `X-Kimi-OpenClaw-Version` header didn't meet the minimum gate. Confirm `openclaw_version: "2026.3.13"` (or newer) is active in your config, and that `X-Kimi-OpenClaw-*` appear in your adapter's WS upgrade headers.
 
 **Subscribe stream keeps reconnecting.** Check Kimi's status — connect+json streaming uses HTTP/1.1 chunked transfer, so intermediaries that buffer aggressively can break long streams. Adjust `reconnect_max_s` to avoid backing off too aggressively.
 
 **Tool-call output clutters Kimi DM UI.** Set `config.extra.user_message_prefix` to a shorter prefix, or configure skills to minimise tool chatter in user-facing summaries.
+
+## Known limitations
+
+**Multi-user DM session collapse.** Kimi's DM channel currently uses a single sentinel `sessionId` (`im:kimi:main`) across all users who DM the bot, and the public ACP frame schema doesn't consistently carry per-user identity in `session/prompt.params`. The adapter probes several plausible field shapes (`sender`, `user`, `author`, `userId`, `user_id`) and routes per-user when identity is present. When it isn't — currently the common case — all DM users collapse into one Hermes session. The adapter emits a one-shot warning log when this happens. For single-user bots this is a non-issue; for multi-user deployments, prefer the group channel until Kimi's DM schema exposes sender identity reliably.
+
+**No DM outbound outside a live WS.** The standalone `send_kimi_message` helper (used by cron and `send_message_tool` when no live gateway is running) only supports group rooms. DM replies require an active `agent-ws` session, which only exists while the gateway is connected.
+
+**Kimi replay on Subscribe reconnect.** When the group `Subscribe` stream reconnects, Kimi replays a short window of recent events. The adapter dedupes by `(chat_id, message_id)` over a 2000-entry ring buffer, which covers typical replay windows. If your bot is in a very high-volume room and messages replay outside the window, duplicates can slip through — raise `_DEDUP_MAXLEN` in `gateway/platforms/kimi.py` if needed.
 
 ## Security notes
 
