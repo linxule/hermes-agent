@@ -26,6 +26,7 @@ from gateway.platforms.kimi import (
     KimiAuthError,
     KimiProtocolError,
     KimiRpcError,
+    _extract_short_id_from_text,
     _extract_user_identity,
     _is_standalone_slash_command,
     _parse_iso8601,
@@ -428,6 +429,37 @@ class UserIdentityExtractionTests(unittest.TestCase):
         uid, name = _extract_user_identity("string")
         self.assertIsNone(uid)
         self.assertIsNone(name)
+
+
+class SenderShortIdPrefixTests(unittest.TestCase):
+    """kimi-claw's [sender_short_id: X] text prefix (group-routed-over-ACP)."""
+
+    def test_extracts_short_id_from_prefix_line(self):
+        text = (
+            "Message From Kimi Group Chat Room:\n"
+            "[sender_short_id: u_abc123]\n"
+            "hello there"
+        )
+        self.assertEqual(_extract_short_id_from_text(text), "u_abc123")
+
+    def test_extracts_short_id_anywhere_in_text(self):
+        # The kimi-claw injector places it after the group prefix; we accept
+        # any line-start match so we're robust to prompt-text transforms.
+        text = "prelude\n[sender_short_id: u_xyz]\nactual content"
+        self.assertEqual(_extract_short_id_from_text(text), "u_xyz")
+
+    def test_no_prefix_returns_none(self):
+        self.assertIsNone(_extract_short_id_from_text("plain message"))
+        self.assertIsNone(_extract_short_id_from_text(""))
+        self.assertIsNone(_extract_short_id_from_text(None))  # type: ignore
+
+    def test_empty_short_id_returns_none(self):
+        # Malformed: empty content between brackets.
+        self.assertIsNone(_extract_short_id_from_text("[sender_short_id: ]"))
+
+    def test_strips_surrounding_whitespace(self):
+        text = "[sender_short_id:   u_padded   ]"
+        self.assertEqual(_extract_short_id_from_text(text), "u_padded")
 
 
 class EnvelopeLengthCapTests(unittest.IsolatedAsyncioTestCase):

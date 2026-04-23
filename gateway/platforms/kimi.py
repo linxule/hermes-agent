@@ -106,6 +106,17 @@ _GROUP_GATE_DEFAULTS = {
 _SLASH_COMMAND_RE = re.compile(r"^/[a-z0-9_-]+$", re.IGNORECASE)
 _DEFAULT_USER_MESSAGE_PREFIX = "User Message From Kimi:\n"
 
+# kimi-claw's prompt-adapter injects sender identity into the prompt text as
+# a `[sender_short_id: <short_id>]` line for group-routed-over-ACP messages
+# (see kimi-claw's user-message-prefix.js::withGroupRoomSenderShortId). The
+# structured session/prompt.params carries only sessionId + prompt by design.
+# We parse this prefix line so per-user routing works when Kimi routes a
+# group message through the DM WS instead of through Subscribe.
+_SENDER_SHORT_ID_LINE_RE = re.compile(
+    r"^\s*\[sender_short_id:\s*([^\]\s][^\]]*?)\s*\]\s*$",
+    re.MULTILINE,
+)
+
 # Kimi's WS frames are large but finite; 4MB matches the bridge setting.
 _WS_MAX_FRAME_SIZE = 4 * 1024 * 1024
 
@@ -203,18 +214,25 @@ def _first_text_block(params: Any) -> Optional[Dict[str, Any]]:
 
 
 def _extract_user_identity(params: Any) -> Tuple[Optional[str], Optional[str]]:
-    """Best-effort extract ``(user_id, user_name)`` from an ACP session/prompt.
+    """Best-effort extract ``(user_id, user_name)`` from ACP ``session/prompt``.
 
-    Kimi's wire format for DM user identity isn't publicly documented. We
-    probe several plausible shapes without failing if none are present:
+    Kimi's public ACP contract defines ``session/prompt.params`` as carrying
+    only ``sessionId`` and ``prompt`` — DMs are 1:1 so sender identity is
+    implicit in the WS session, and groups are normally delivered via the
+    Subscribe stream (which carries structured sender metadata). There is no
+    documented sender-identity field on ``params`` for either case.
 
-      - ``params["sender"]`` / ``params["user"]`` / ``params["author"]``:
-        nested dicts with ``id`` / ``userId`` / ``name``
-      - ``params["userId"]`` / ``params["user_id"]`` (flat)
+    Defensive probes we still run (for future schema additions and any
+    non-standard deployments):
 
-    Returns ``(None, None)`` if no identity can be extracted; caller must
-    fall back to a session-derived id and log the multi-user collapse
-    limitation.
+      - Nested ``params["sender"]`` / ``params["user"]`` / ``params["author"]``
+        with ``id`` / ``userId`` / ``name``
+      - Flat ``params["userId"]`` / ``params["user_id"]``
+
+    Returns ``(None, None)`` if none of these shapes are present. Callers
+    should then probe the prompt text for a ``[sender_short_id: X]`` prefix
+    via :func:`_extract_short_id_from_text` (kimi-claw's injection convention
+    for group-routed-over-ACP messages).
     """
     if not isinstance(params, dict):
         return None, None
@@ -231,6 +249,23 @@ def _extract_user_identity(params: Any) -> Tuple[Optional[str], Optional[str]]:
             )
     user_id = user_id or params.get("userId") or params.get("user_id")
     return user_id, user_name
+
+
+def _extract_short_id_from_text(text: str) -> Optional[str]:
+    """Return the ``sender_short_id`` from kimi-claw's text prefix, if present.
+
+    kimi-claw's client injects a ``[sender_short_id: <short_id>]`` line into
+    the prompt text when forwarding a group-room message over the DM ACP WS
+    (see kimi-claw ``src/user-message-prefix.js::withGroupRoomSenderShortId``).
+    We treat this as the authoritative sender identity for that routing
+    mode. The structured `params` surface does not carry it.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    m = _SENDER_SHORT_ID_LINE_RE.search(text)
+    if not m:
+        return None
+    return m.group(1).strip() or None
 
 
 def _split_for_streaming(text: str, chunk_size: int) -> List[str]:
@@ -860,19 +895,25 @@ class KimiAdapter(BasePlatformAdapter):
             _DMInflight(kimi_sid=kimi_sid, req_id=req_id)
         )
 
-        # Best-effort extract a per-user identity so multi-user bots route
-        # DMs to per-user sessions rather than collapsing everyone into one.
-        # Kimi's wire format isn't publicly documented; we fall back to
-        # sessionId-derived identity + a one-shot warning log if nothing was
-        # provided.
+        # Resolve a per-user identity. Kimi's ACP contract only carries
+        # sessionId + prompt on `params` by design; identity is implicit on
+        # 1:1 DMs. For group-routed-over-ACP messages kimi-claw injects a
+        # `[sender_short_id: X]` prefix into the prompt text, so we fall
+        # through to that surface before giving up and using a sid-derived id.
         user_id, user_name = _extract_user_identity(params)
+        if not user_id:
+            short_id = _extract_short_id_from_text(text)
+            if short_id:
+                user_id = f"kimi:{short_id}"
         if not user_id:
             if not self._warned_dm_collapse:
                 logger.warning(
-                    "Kimi DM: session/prompt carries no user identity — "
-                    "multi-user bots on this adapter will collapse all DM "
-                    "users into a single Hermes session. Sending will still "
-                    "work; session state won't be isolated per user."
+                    "Kimi DM: session/prompt carries no user identity and "
+                    "prompt text has no [sender_short_id: X] prefix — this "
+                    "is expected for 1:1 DMs (single user). Multi-user "
+                    "bots reading this WS will collapse all users into "
+                    "one Hermes session; session state won't be isolated "
+                    "per user. See docs § Known limitations."
                 )
                 self._warned_dm_collapse = True
             user_id = f"kimi:dm:{kimi_sid}"
