@@ -397,6 +397,33 @@ def _event_payload(event: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]
     return None, {}
 
 
+def _redact_sender(short_id_or_id: Optional[str]) -> str:
+    """Redact a Kimi sender identifier for safe INFO-level logging.
+
+    Keeps the ``u_`` / ``b_`` type prefix plus the first 4 chars of the
+    body, and masks the rest. Enough signal for an operator to spot a
+    misconfigured ``group_trusted_senders`` (unique-ish prefix + known
+    peer list → identification by pattern) without bleeding full
+    short_ids into log aggregators.
+
+    Examples::
+
+        _redact_sender("u_gs5ri2l5dpytlap") -> "u_gs5r****"
+        _redact_sender("b_ipt7azbrrljvjsu") -> "b_ipt7****"
+        _redact_sender("kimi")              -> "kimi"  # <= 4 chars untouched
+        _redact_sender(None)                -> "<none>"
+    """
+    if not short_id_or_id:
+        return "<none>"
+    s = str(short_id_or_id)
+    if len(s) <= 4:
+        return s
+    # Preserve "u_" / "b_" prefix if present → "u_" + 4 chars + ****
+    if len(s) >= 6 and s[1] == "_":
+        return f"{s[:6]}****"
+    return f"{s[:4]}****"
+
+
 def _block_text(block: Any) -> Optional[str]:
     if not isinstance(block, dict):
         return None
@@ -846,6 +873,15 @@ class KimiAdapter(BasePlatformAdapter):
         self._reconnect_max_s: float = float(
             config.extra.get("reconnect_max_s", _RECONNECT_MAX_S_DEFAULT)
         )
+        # Subscribe (group) backoff state — instance-scoped so a successful
+        # stream (first processed frame post-connect) can reset it without
+        # driving bot-thrash: after reset, the next reconnect delay starts
+        # from the floor (not base), preventing oscillation hammering Kimi's
+        # infra when the stream flaps every ~30-60s.
+        self._group_subscribe_backoff_base: float = _RECONNECT_MIN_S
+        self._group_subscribe_backoff_floor: float = 10.0
+        self._group_subscribe_backoff: float = self._group_subscribe_backoff_base
+        self._group_subscribe_frame_since_connect: bool = False
         self._ws_ping_interval: int = int(config.extra.get("ws_ping_interval", 15))
         self._ws_ping_timeout: int = int(config.extra.get("ws_ping_timeout", 60))
         self._dm_app_keepalive_s: float = float(
@@ -1754,8 +1790,24 @@ class KimiAdapter(BasePlatformAdapter):
     # ──────────────────────────────────────────────────────────────────────
 
     async def _group_subscribe_loop(self) -> None:
-        """Maintain the global ``Subscribe`` stream with reconnect backoff."""
-        backoff = _RECONNECT_MIN_S
+        """Maintain the global ``Subscribe`` stream with reconnect backoff.
+
+        Backoff state lives on the adapter (``_group_subscribe_backoff``) so a
+        successful stream (first processed ``chatMessage`` frame post-connect)
+        can reset it. The reset is conditional on the current backoff already
+        exceeding the floor:
+
+        - Cold start (backoff == base == 2s) → no reset, no log.
+        - Grown state (e.g. 32s after churn) → clamps to floor (10s) and
+          emits ``"stream recovered after N.Ns backoff"`` once per cycle.
+
+        Only ``chatMessage`` events arm the hook — keepalive pings, typing,
+        and control events cannot reset backoff (a degraded stream emitting
+        only pings would otherwise thrash back to the floor every cycle).
+        The floor (10s) rather than the base (2s) stays oscillation-safe: a
+        flap-every-30s pattern would otherwise hammer Kimi's infra at
+        2→4→8→... on every cycle.
+        """
         while not self._closing:
             rc = await self._group_subscribe_once()
             if self._closing or rc == 3:
@@ -1770,12 +1822,16 @@ class KimiAdapter(BasePlatformAdapter):
             if rc == 1:
                 logger.error("Kimi groups: terminal error, stopping loop")
                 return
-            logger.info("Kimi groups: reconnecting in %.1fs", backoff)
+            logger.info(
+                "Kimi groups: reconnecting in %.1fs", self._group_subscribe_backoff
+            )
             try:
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(self._group_subscribe_backoff)
             except asyncio.CancelledError:
                 return
-            backoff = min(backoff * 2, self._reconnect_max_s)
+            self._group_subscribe_backoff = min(
+                self._group_subscribe_backoff * 2, self._reconnect_max_s
+            )
 
     async def _group_subscribe_once(self) -> int:
         """One Subscribe stream session.
@@ -1800,9 +1856,41 @@ class KimiAdapter(BasePlatformAdapter):
                 if resp.status != 200:
                     logger.warning("Kimi groups: Subscribe HTTP %s", resp.status)
                     return 0
+                # Fresh connection — arm the first-frame hook. Reset + log
+                # fire exactly once per reconnect cycle (see below).
+                self._group_subscribe_frame_since_connect = False
                 try:
                     async for event in self._connect_envelope_parser(resp.content):
+                        # Classify BEFORE dispatch so ping/control/unsupported
+                        # events can't satisfy the first-frame hook.
+                        case, _ = _event_payload(event) if isinstance(event, dict) else (None, {})
+                        is_chat_message = case == "chatMessage"
                         await self._on_group_event(event)
+                        # First-frame hook runs AFTER successful dispatch AND
+                        # only for chatMessage events. Keepalive pings, typing
+                        # events, and unsupported shapes must NOT reset backoff
+                        # — a degraded Subscribe stream emitting only pings
+                        # would otherwise thrash back to the floor each cycle.
+                        # If _on_group_event raises, we never reach this block
+                        # (exception propagates to the handlers below) — so
+                        # the state flip and log only fire on genuine recovery.
+                        if is_chat_message and not self._group_subscribe_frame_since_connect:
+                            self._group_subscribe_frame_since_connect = True
+                            prev_backoff = self._group_subscribe_backoff
+                            # Conditional reset: only clamp to the floor when
+                            # backoff actually grew beyond it. Cold start
+                            # (backoff=base=2s) stays at 2s with no spurious
+                            # "stream recovered" log on every process boot.
+                            # Grown state (e.g. 32s) clamps to floor (10s) —
+                            # never below, to stay oscillation-safe.
+                            if prev_backoff > self._group_subscribe_backoff_floor:
+                                self._group_subscribe_backoff = (
+                                    self._group_subscribe_backoff_floor
+                                )
+                                logger.info(
+                                    "Kimi groups: stream recovered after %.1fs backoff",
+                                    prev_backoff,
+                                )
                 except KimiAuthError as exc:
                     logger.error("Kimi groups: %s", exc)
                     return 3
@@ -1994,10 +2082,18 @@ class KimiAdapter(BasePlatformAdapter):
                 )
                 return
             elif policy == "trusted_only":
+                # INFO with redacted sender: operators need a grep-able
+                # signal that messages are being dropped (e.g. after
+                # forgetting to add a new teammate to group_trusted_senders).
+                # Full short_ids at INFO would leak hundreds of user
+                # identifiers into log aggregators in a kimi-claw group
+                # where every user message has role='assistant', so we
+                # redact to prefix + 4 chars. Full identifiers are still
+                # available at DEBUG via the raw event dumps.
                 logger.info(
-                    "Kimi groups: dropping non-user message %s/%s role=%r sender=%r (not in group_trusted_senders)",
+                    "Kimi groups: dropping non-user message %s/%s role=%r sender=%s (not in group_trusted_senders)",
                     chat_id, message_id, message_role,
-                    sender_short_id or sender_id,
+                    _redact_sender(sender_short_id or sender_id),
                 )
                 return
             elif policy == "mentions":

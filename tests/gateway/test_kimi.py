@@ -17,7 +17,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageType, SendResult
 from gateway.platforms.kimi import (
     _CONNECT_FLAG_COMPRESSED,
@@ -28,6 +28,7 @@ from gateway.platforms.kimi import (
     KimiAuthError,
     KimiProtocolError,
     KimiRpcError,
+    KimiTransientError,
     _extract_short_id_from_text,
     _extract_user_identity,
     _is_standalone_slash_command,
@@ -1215,6 +1216,23 @@ class AuthorizationIntegrationTests(unittest.TestCase):
         self.assertIn('Platform.KIMI: "KIMI_ALLOWED_USERS"', text)
         self.assertIn('Platform.KIMI: "KIMI_ALLOW_ALL_USERS"', text)
 
+    def test_nag_guard_uses_config_get_home_channel(self):
+        """Source-level verification that the nag-guard fix is still in place.
+
+        ``HomeChannelNagGuardTests`` exercises the two-source guard by
+        replicating the condition in Python, which would still pass if a
+        future edit regressed the prod code back to ``os.getenv``-only.
+        Anchor the test to the production expression directly so that
+        regression would surface here.
+        """
+        import pathlib
+        run_py = (
+            pathlib.Path(__file__).parent.parent.parent
+            / "gateway" / "run.py"
+        )
+        text = run_py.read_text()
+        self.assertIn("self.config.get_home_channel(source.platform)", text)
+
     def test_group_allowlist_accepts_raw_room_id(self):
         from gateway.run import GatewayRunner
 
@@ -1650,6 +1668,362 @@ class LifecycleStatusTests(unittest.IsolatedAsyncioTestCase):
         adapter._group_subscribe_once = AsyncMock(return_value=3)  # type: ignore
         await adapter._group_subscribe_loop()
         self.assertEqual(adapter._fatal_error_code, "kimi_groups_auth")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Wave-2 hardening (Commit 4)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TrustedOnlyDropLogLevelTests(unittest.IsolatedAsyncioTestCase):
+    """trusted_only drops log at INFO with a redacted sender — balancing
+    operator visibility against PII hygiene.
+
+    The prior shape (INFO + full short_id) leaked identifiers into log
+    aggregators in kimi-claw groups where every user message has
+    role='assistant'. The DEBUG demote that followed removed the operator
+    tripwire for misconfigured ``group_trusted_senders``. Current shape:
+    INFO with sender redacted to ``prefix + 4 chars + ****`` — enough to
+    diagnose drops without bleeding full identities.
+    """
+
+    async def test_trusted_only_drop_emits_info_with_redacted_sender(self):
+        adapter = KimiAdapter(_cfg(
+            group_allow_bot_senders="trusted_only",
+            group_trusted_senders=["u_someone_else"],
+        ))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        # Use a realistic-looking short_id so we can assert that the
+        # redaction preserves only the prefix + first 4 body chars.
+        msg = _bot_msg(senderShortId="u_gs5ri2l5dpytlap", senderId="assistant-long-id-xyz")
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.DEBUG) as cm:
+            await adapter._on_group_event(msg)
+
+        adapter.handle_message.assert_not_awaited()
+
+        drop_records = [
+            r for r in cm.records
+            if "not in group_trusted_senders" in r.getMessage()
+        ]
+        self.assertEqual(len(drop_records), 1, f"expected one drop log, got: {drop_records}")
+        # INFO, not DEBUG — operators need a grep-able signal.
+        self.assertEqual(drop_records[0].levelno, logging.INFO)
+        rendered = drop_records[0].getMessage()
+        # Redacted token present; full tail absent.
+        self.assertIn("u_gs5r****", rendered)
+        self.assertNotIn("gs5ri2l5dpytlap", rendered)
+
+    async def test_trusted_only_drop_redacts_sender_id_when_short_id_absent(self):
+        """If only sender_id is set (no short_id), that too must be redacted."""
+        adapter = KimiAdapter(_cfg(
+            group_allow_bot_senders="trusted_only",
+            group_trusted_senders=["u_someone_else"],
+        ))
+        adapter.handle_message = AsyncMock()  # type: ignore
+
+        msg = _bot_msg(senderShortId=None, senderId="assistant-long-id-xyz")
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.DEBUG) as cm:
+            await adapter._on_group_event(msg)
+
+        drop_records = [
+            r for r in cm.records
+            if "not in group_trusted_senders" in r.getMessage()
+        ]
+        self.assertEqual(len(drop_records), 1)
+        self.assertEqual(drop_records[0].levelno, logging.INFO)
+        rendered = drop_records[0].getMessage()
+        # "assistant-long-id-xyz" has no "u_"/"b_" prefix → first 4 + ****.
+        self.assertIn("assi****", rendered)
+        self.assertNotIn("assistant-long-id-xyz", rendered)
+
+
+class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
+    """Subscribe reconnect backoff is instance-scoped and resets to the
+    oscillation-safe floor (10s) on the first processed frame post-connect.
+
+    Pre-fix: backoff was a loop-local int that only grew monotonically.
+    After hitting the 60s cap it stayed at 60s forever — messages arriving
+    during reconnect windows silently lost.
+
+    The fix resets backoff to ``floor`` (not ``base``) so flap-every-30s
+    oscillation doesn't drive reconnect delay back to 2s every cycle,
+    which would hammer Kimi's infra.
+    """
+
+    def _make_parser(self, events):
+        """Return an async generator function that yields the given events."""
+        async def _gen(_content):
+            for ev in events:
+                yield ev
+        return _gen
+
+    def _install_fake_session(self, adapter):
+        """Replace _http_session.post() with a context manager yielding HTTP 200."""
+        resp = MagicMock()
+        resp.status = 200
+
+        class _AsyncCtx:
+            async def __aenter__(self_inner):
+                return resp
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        session = MagicMock()
+        session.post = MagicMock(return_value=_AsyncCtx())
+        adapter._http_session = session
+
+    async def test_subscribe_backoff_resets_to_floor_after_first_frame(self):
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        # Pretend we've grown backoff to the cap from prior reconnect churn.
+        adapter._group_subscribe_backoff = 60.0
+        adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+            [{"chatMessage": {"chatId": "c", "messageId": "m"}}]
+        )
+        adapter._on_group_event = AsyncMock()  # type: ignore
+
+        rc = await adapter._group_subscribe_once()
+
+        self.assertEqual(rc, 0)
+        # Reset lands at floor (10s) — NOT base (2s) and NOT the prior 60s.
+        self.assertEqual(adapter._group_subscribe_backoff, 10.0)
+        self.assertTrue(adapter._group_subscribe_frame_since_connect)
+
+    async def test_subscribe_backoff_respects_floor_under_oscillation(self):
+        """Once backoff has grown past the floor, reconnect recoveries must
+        clamp to the floor — never below — so a flap-every-30s oscillation
+        can't drive the reconnect delay back to the 2s base each cycle.
+
+        Seed at ``floor * 2`` to skip the cold-start no-reset window and
+        exercise the oscillation invariant directly.
+        """
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._on_group_event = AsyncMock()  # type: ignore
+        # Seed past the floor so every cycle genuinely hits the reset path.
+        adapter._group_subscribe_backoff = adapter._group_subscribe_backoff_floor * 2
+
+        observed_backoffs = []
+        for cycle in range(3):
+            adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+                [{"chatMessage": {"chatId": f"c{cycle}", "messageId": f"m{cycle}"}}]
+            )
+            await adapter._group_subscribe_once()
+            observed_backoffs.append(adapter._group_subscribe_backoff)
+            # Simulate the loop's post-error grow step between cycles.
+            adapter._group_subscribe_backoff = min(
+                adapter._group_subscribe_backoff * 2, adapter._reconnect_max_s,
+            )
+
+        # Every post-reset value is at least the floor (10s). Without the
+        # floor, naive reset to base would yield 2s on every cycle → thrash.
+        for value in observed_backoffs:
+            self.assertGreaterEqual(value, adapter._group_subscribe_backoff_floor)
+
+    async def test_subscribe_emits_recovered_log_after_frame(self):
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._group_subscribe_backoff = 32.0  # mid-growth reconnect
+        adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+            [{"chatMessage": {"chatId": "c", "messageId": "m"}}]
+        )
+        adapter._on_group_event = AsyncMock()  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.INFO) as cm:
+            await adapter._group_subscribe_once()
+
+        recovered = [r for r in cm.records if "stream recovered" in r.getMessage()]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].levelno, logging.INFO)
+        # Log carries the backoff that was in effect at the time of the
+        # reconnect — useful operator signal for "how long were we down".
+        self.assertIn("32.0s", recovered[0].getMessage())
+
+    async def test_subscribe_no_duplicate_recovered_log(self):
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._group_subscribe_backoff = 32.0  # past the floor → recovery will log
+        adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+            [
+                {"chatMessage": {"chatId": "c", "messageId": "m1"}},
+                {"chatMessage": {"chatId": "c", "messageId": "m2"}},
+                {"chatMessage": {"chatId": "c", "messageId": "m3"}},
+            ]
+        )
+        adapter._on_group_event = AsyncMock()  # type: ignore
+
+        with self.assertLogs("gateway.platforms.kimi", level=logging.INFO) as cm:
+            await adapter._group_subscribe_once()
+
+        recovered = [r for r in cm.records if "stream recovered" in r.getMessage()]
+        self.assertEqual(len(recovered), 1, f"expected exactly one 'stream recovered', got: {len(recovered)}")
+
+    def _capture_records(self, level=logging.DEBUG):
+        """Attach a list-capturing handler to the kimi logger.
+
+        Unlike ``assertLogs``, does not require at least one record —
+        suitable for tests that expect *zero* logs from a code path.
+        Returns (records_list, teardown_callable).
+        """
+        records: list = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self_inner, record):
+                records.append(record)
+
+        handler = _ListHandler(level=level)
+        kimi_logger = logging.getLogger("gateway.platforms.kimi")
+        prev_level = kimi_logger.level
+        kimi_logger.addHandler(handler)
+        kimi_logger.setLevel(level)
+
+        def _teardown():
+            kimi_logger.removeHandler(handler)
+            kimi_logger.setLevel(prev_level)
+
+        return records, _teardown
+
+    async def test_subscribe_backoff_not_reset_on_keepalive_ping(self):
+        """A degraded stream emitting only keepalive pings must NOT reset
+        backoff — otherwise a ping-only loop would thrash back to the floor
+        on every reconnect and hammer Kimi's infra.
+        """
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._group_subscribe_backoff = 32.0  # would be reset if ping counted
+        adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+            [{"ping": {}}]
+        )
+        adapter._on_group_event = AsyncMock()  # type: ignore
+
+        records, teardown = self._capture_records()
+        try:
+            await adapter._group_subscribe_once()
+        finally:
+            teardown()
+
+        # Backoff unchanged, hook not armed, no recovery log emitted.
+        self.assertEqual(adapter._group_subscribe_backoff, 32.0)
+        self.assertFalse(adapter._group_subscribe_frame_since_connect)
+        recovered = [r for r in records if "stream recovered" in r.getMessage()]
+        self.assertEqual(recovered, [])
+
+    async def test_subscribe_backoff_not_reset_on_empty_stream(self):
+        """Stream opens and closes cleanly with zero events — must NOT flip
+        state or emit the recovery log.
+        """
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._group_subscribe_backoff = 32.0
+        adapter._connect_envelope_parser = self._make_parser([])  # type: ignore
+        adapter._on_group_event = AsyncMock()  # type: ignore
+
+        records, teardown = self._capture_records()
+        try:
+            rc = await adapter._group_subscribe_once()
+        finally:
+            teardown()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(adapter._group_subscribe_backoff, 32.0)
+        self.assertFalse(adapter._group_subscribe_frame_since_connect)
+        recovered = [r for r in records if "stream recovered" in r.getMessage()]
+        self.assertEqual(recovered, [])
+
+    async def test_subscribe_backoff_not_reset_on_handler_exception(self):
+        """If _on_group_event raises on the first chatMessage, the state
+        flip and recovery log must NOT fire — otherwise a dispatch-error
+        loop would masquerade as a healthy stream.
+
+        The exception should still propagate as before (caught by the
+        outer handlers into return code 0 / transient retry).
+        """
+        adapter = KimiAdapter(_cfg())
+        self._install_fake_session(adapter)
+        adapter._group_subscribe_backoff = 32.0
+        adapter._connect_envelope_parser = self._make_parser(  # type: ignore
+            [{"chatMessage": {"chatId": "c", "messageId": "m"}}]
+        )
+        adapter._on_group_event = AsyncMock(  # type: ignore
+            side_effect=KimiTransientError("simulated handler failure")
+        )
+
+        records, teardown = self._capture_records()
+        try:
+            rc = await adapter._group_subscribe_once()
+        finally:
+            teardown()
+
+        # Transient handler errors are swallowed to rc=0 (retry) by the
+        # outer except block, so the caller retries the reconnect.
+        self.assertEqual(rc, 0)
+        # Exception pre-empted the state flip — backoff untouched.
+        self.assertEqual(adapter._group_subscribe_backoff, 32.0)
+        self.assertFalse(adapter._group_subscribe_frame_since_connect)
+        recovered = [r for r in records if "stream recovered" in r.getMessage()]
+        self.assertEqual(recovered, [])
+
+
+class HomeChannelNagGuardTests(unittest.IsolatedAsyncioTestCase):
+    """Home-channel nag suppresses when /sethome has persisted a channel.
+
+    Pre-fix: the guard at run.py:4415 checked ``os.getenv(env_key)`` only.
+    The /sethome handler (run.py:5952) persists to config.yaml via
+    ``HomeChannel`` wiring AND sets the env var, but a gateway restarted
+    after /sethome may lose env-var state before config reloads — and
+    the authoritative source is the config, not the environment.
+
+    The fix checks ``self.config.get_home_channel(platform)`` first, then
+    falls back to env for the true first-run case.
+
+    These tests exercise the guard condition directly because
+    ``_handle_message_with_agent`` spans 2000+ lines and requires the
+    entire GatewayRunner state graph to reach the nag block. The
+    condition itself is a 2-line expression — a focused unit test on
+    that expression gives higher signal than a flaky end-to-end.
+    """
+
+    def _evaluate_nag_condition(self, config, platform, env_key_present: bool) -> bool:
+        """Replicate the guard at gateway/run.py:4425-4438 exactly.
+
+        Returns True iff the nag SHOULD fire under the given config+env.
+        """
+        env_value = "some-chat-id" if env_key_present else None
+        home_channel = config.get_home_channel(platform)
+        # Guard from run.py: send nag if neither source has a value.
+        return not home_channel and not env_value
+
+    def test_home_channel_nag_suppressed_when_config_has_home_channel(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.KIMI: PlatformConfig(
+                    enabled=True,
+                    token="tok",
+                    home_channel=HomeChannel(
+                        platform=Platform.KIMI,
+                        chat_id="room:abc",
+                        name="Home",
+                    ),
+                ),
+            },
+        )
+        # Config has a home channel; env is empty — nag must NOT fire.
+        self.assertFalse(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=False))
+        # Sanity: the config API used by the fix returns the HomeChannel object.
+        self.assertIsNotNone(config.get_home_channel(Platform.KIMI))
+
+    def test_home_channel_nag_fires_when_both_env_and_config_empty(self):
+        """True first-run: no env, no config → operator should be prompted."""
+        config = GatewayConfig(
+            platforms={Platform.KIMI: PlatformConfig(enabled=True, token="tok")},
+        )
+        self.assertTrue(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=False))
+        # Env-set first-run path still suppresses (preserved behavior).
+        self.assertFalse(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=True))
 
 
 if __name__ == "__main__":

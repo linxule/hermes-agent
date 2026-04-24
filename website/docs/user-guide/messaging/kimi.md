@@ -99,7 +99,7 @@ Within an authorized room, group events go through a role-based content filter: 
 - `group_trusted_senders` — a list of short_ids and/or Kimi user ids. Any sender in this list bypasses the role-content filter. This is the authoritative sender-identity gate — use it whenever you know the concrete identity of a bot you want to hear from.
 - `group_allow_bot_senders` — policy for non-user-role senders that aren't in `group_trusted_senders`:
   - `"off"` (default) — drop all non-user-role messages. Matches pre-existing behavior.
-  - `"trusted_only"` — drop unless sender is in `group_trusted_senders` (drops silently, logs at INFO).
+  - `"trusted_only"` — drop unless sender is in `group_trusted_senders`. Drops log at INFO with a redacted sender identifier (prefix + first 4 chars, e.g. `u_gs5r****`) so operators can spot a misconfigured allowlist without leaking full short_ids into log aggregators. Full identifiers remain available via DEBUG-level raw event dumps.
   - `"mentions"` — dispatch only if the message @-mentions this bot. **EXPERIMENTAL.** Kimi's mention metadata may be client-provided rather than server-enriched (unverified as of this commit). Until the spoofability probe runs, a malicious sender could forge `mentions: [{short_id: <us>}]` to bypass this gate. For production authorization of bot senders, prefer `trusted_only` with an explicit allowlist. `"mentions"` is most useful on short-lived experimental deployments where the participant set is already controlled out-of-band.
   - `"all"` — dispatch every non-user-role message (treat identically to `USER` role). Equivalent to disabling the role filter entirely for bot senders.
 

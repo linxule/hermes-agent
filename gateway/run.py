@@ -4529,10 +4529,15 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+        # Suppress once /sethome has persisted a channel — that handler writes
+        # both KIMI_HOME_CHANNEL-style env keys AND config.yaml. We check
+        # config first (authoritative source) and fall back to env for the
+        # first-run case where the session predates any /sethome.
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-            if not os.getenv(env_key):
+            home_channel = self.config.get_home_channel(source.platform)
+            if not home_channel and not os.getenv(env_key):
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     await adapter.send(
