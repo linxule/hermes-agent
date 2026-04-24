@@ -29,11 +29,13 @@ from gateway.platforms.kimi import (
     KimiProtocolError,
     KimiRpcError,
     KimiTransientError,
+    _extract_blocks_payload,
     _extract_short_id_from_text,
     _extract_user_identity,
     _is_standalone_slash_command,
     _parse_iso8601,
     _split_for_streaming,
+    _ulid_time_ms,
     check_kimi_requirements,
 )
 from gateway.session import SessionSource
@@ -1862,31 +1864,6 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         recovered = [r for r in cm.records if "stream recovered" in r.getMessage()]
         self.assertEqual(len(recovered), 1, f"expected exactly one 'stream recovered', got: {len(recovered)}")
 
-    def _capture_records(self, level=logging.DEBUG):
-        """Attach a list-capturing handler to the kimi logger.
-
-        Unlike ``assertLogs``, does not require at least one record —
-        suitable for tests that expect *zero* logs from a code path.
-        Returns (records_list, teardown_callable).
-        """
-        records: list = []
-
-        class _ListHandler(logging.Handler):
-            def emit(self_inner, record):
-                records.append(record)
-
-        handler = _ListHandler(level=level)
-        kimi_logger = logging.getLogger("gateway.platforms.kimi")
-        prev_level = kimi_logger.level
-        kimi_logger.addHandler(handler)
-        kimi_logger.setLevel(level)
-
-        def _teardown():
-            kimi_logger.removeHandler(handler)
-            kimi_logger.setLevel(prev_level)
-
-        return records, _teardown
-
     async def test_subscribe_backoff_not_reset_on_keepalive_ping(self):
         """A degraded stream emitting only keepalive pings must NOT reset
         backoff — otherwise a ping-only loop would thrash back to the floor
@@ -1900,7 +1877,7 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         )
         adapter._on_group_event = AsyncMock()  # type: ignore
 
-        records, teardown = self._capture_records()
+        records, teardown = _capture_kimi_log_records()
         try:
             await adapter._group_subscribe_once()
         finally:
@@ -1922,7 +1899,7 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         adapter._connect_envelope_parser = self._make_parser([])  # type: ignore
         adapter._on_group_event = AsyncMock()  # type: ignore
 
-        records, teardown = self._capture_records()
+        records, teardown = _capture_kimi_log_records()
         try:
             rc = await adapter._group_subscribe_once()
         finally:
@@ -1952,7 +1929,7 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
             side_effect=KimiTransientError("simulated handler failure")
         )
 
-        records, teardown = self._capture_records()
+        records, teardown = _capture_kimi_log_records()
         try:
             rc = await adapter._group_subscribe_once()
         finally:
@@ -2024,6 +2001,608 @@ class HomeChannelNagGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=False))
         # Env-set first-run path still suppresses (preserved behavior).
         self.assertFalse(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=True))
+
+
+def _capture_kimi_log_records(level: int = logging.DEBUG):
+    """Attach a list-capturing handler to the kimi logger.
+
+    Module-level shared helper used by both ``SubscribeBackoffStateTests``
+    and the Probe* test classes. Unlike ``assertLogs``, does not require
+    at least one record — suitable for tests that expect *zero* logs
+    from a code path. Returns ``(records_list, teardown_callable)``.
+    """
+    records: list = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self_inner, record):
+            records.append(record)
+
+    handler = _ListHandler(level=level)
+    kimi_logger = logging.getLogger("gateway.platforms.kimi")
+    prev_level = kimi_logger.level
+    kimi_logger.addHandler(handler)
+    kimi_logger.setLevel(level)
+
+    def _teardown():
+        kimi_logger.removeHandler(handler)
+        kimi_logger.setLevel(prev_level)
+
+    return records, _teardown
+
+
+class Probe1BlockCaseTypeTests(unittest.TestCase):
+    """Probe (H-A): DEBUG dump of non-text block shapes from
+    ``_extract_blocks_payload``. Discriminates fragmented long messages
+    from unknown block variants (resourceLink, mention, code, etc.)
+    without behavior change.
+    """
+
+    def test_block_probe_fires_for_unknown_block_type(self):
+        """resourceLink block with no text → per-block DEBUG log includes
+        content_case, and the aggregate summary reports envelope lengths.
+        """
+        msg = {
+            "text": "envelope preview text",
+            "summary": "envelope preview summary",
+            "blocks": [
+                {
+                    "id": "b1",
+                    "content": {
+                        "case": "resourceLink",
+                        "value": {"uri": "kimi://file/x", "title": "x"},
+                    },
+                }
+            ],
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            text, urls, types = _extract_blocks_payload(msg)
+        finally:
+            teardown()
+
+        # Behavior unchanged: no text, but URI still extracted.
+        self.assertEqual(text, "")
+        self.assertEqual(urls, ["kimi://file/x"])
+        self.assertEqual(types, ["resource_link"])
+
+        per_block = [
+            r for r in records
+            if "non-text block (no extracted text)" in r.getMessage()
+        ]
+        self.assertEqual(len(per_block), 1, f"expected one per-block log, got: {per_block}")
+        self.assertEqual(per_block[0].levelno, logging.DEBUG)
+        rendered = per_block[0].getMessage()
+        self.assertIn("'content_case': 'resourceLink'", rendered)
+        self.assertIn("'has_uri': True", rendered)
+
+        # Aggregate summary with envelope lengths (Fix D oracle).
+        summary_log = [
+            r for r in records
+            if "non-text block(s)" in r.getMessage()
+        ]
+        self.assertEqual(len(summary_log), 1)
+        rendered_sum = summary_log[0].getMessage()
+        self.assertIn("extracted_text=0", rendered_sum)
+        self.assertIn(f"envelope_text={len('envelope preview text')}", rendered_sum)
+        self.assertIn(f"envelope_summary={len('envelope preview summary')}", rendered_sum)
+
+    def test_block_probe_silent_for_text_blocks(self):
+        """Normal text-bearing block must emit no probe log (neither per-block
+        nor aggregate summary).
+        """
+        msg = {
+            "blocks": [
+                {
+                    "id": "b1",
+                    "content": {
+                        "case": "text",
+                        "value": {"content": "hello world"},
+                    },
+                }
+            ],
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            text, _, _ = _extract_blocks_payload(msg)
+        finally:
+            teardown()
+
+        self.assertEqual(text, "hello world")
+        per_block = [
+            r for r in records
+            if "non-text block (no extracted text)" in r.getMessage()
+        ]
+        self.assertEqual(per_block, [])
+        summary_log = [
+            r for r in records
+            if "non-text block(s)" in r.getMessage()
+        ]
+        self.assertEqual(summary_log, [])
+
+    def test_block_probe_silent_for_all_text_blocks(self):
+        """Negative-assertion: every block yields text → neither per-block
+        probe nor the aggregate summary fires (Fix E trigger invariant).
+        """
+        msg = {
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": "alpha"}}},
+                {"content": {"case": "text", "value": {"content": "beta"}}},
+            ],
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            text, _, _ = _extract_blocks_payload(msg)
+        finally:
+            teardown()
+
+        self.assertEqual(text, "alpha\nbeta")
+        probe = [
+            r for r in records
+            if "non-text block" in r.getMessage()
+        ]
+        self.assertEqual(probe, [])
+
+    def test_block_probe_handles_non_dict_block(self):
+        """Malformed non-dict block → no crash; DEBUG log includes type name."""
+        msg = {"blocks": ["not a dict", 42]}
+        records, teardown = _capture_kimi_log_records()
+        try:
+            text, urls, types = _extract_blocks_payload(msg)
+        finally:
+            teardown()
+
+        self.assertEqual(text, "")
+        self.assertEqual(urls, [])
+        self.assertEqual(types, [])
+
+        per_block = [
+            r for r in records
+            if "non-text block (no extracted text)" in r.getMessage()
+        ]
+        self.assertEqual(len(per_block), 2)
+        rendered = " ".join(r.getMessage() for r in per_block)
+        self.assertIn("'type': 'str'", rendered)
+        self.assertIn("'type': 'int'", rendered)
+
+    def test_block_probe_logs_envelope_lengths(self):
+        """Fix D oracle: aggregate log reports envelope text/summary lengths
+        + extracted length, so operators can distinguish "legitimate media
+        attachment" from "orphaned fragmented tail".
+        """
+        msg = {
+            "text": "short envelope",
+            "summary": "much longer envelope preview than the extracted bit",
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": "hi"}}},
+                {
+                    "id": "b2",
+                    "content": {
+                        "case": "resourceLink",
+                        "value": {"uri": "kimi://file/y"},
+                    },
+                },
+            ],
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            text, _, _ = _extract_blocks_payload(msg)
+        finally:
+            teardown()
+
+        self.assertEqual(text, "hi")
+        summary_log = [
+            r for r in records
+            if "non-text block(s)" in r.getMessage()
+        ]
+        self.assertEqual(len(summary_log), 1)
+        rendered = summary_log[0].getMessage()
+        self.assertIn("extracted_text=2", rendered)
+        self.assertIn(f"envelope_text={len('short envelope')}", rendered)
+        self.assertIn(
+            f"envelope_summary={len('much longer envelope preview than the extracted bit')}",
+            rendered,
+        )
+        # Oracle signature: envelope_summary > extracted_text → operator
+        # sees the mismatch immediately.
+        self.assertGreater(
+            len("much longer envelope preview than the extracted bit"),
+            2,
+        )
+
+
+class Probe2TextSourceTests(unittest.IsolatedAsyncioTestCase):
+    """Probe (H-B): DEBUG log reports which source populated ``text``
+    (blocks / text / summary / none) and the lengths of each candidate.
+    Reveals when a short summary silently wins over empty blocks and
+    bypasses the hydration gate.
+    """
+
+    def _adapter(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        # Disable hydration so the probe log fires on the original text,
+        # not on the re-extracted hydrated payload.
+        adapter._hydrate_missing_text = False
+        return adapter
+
+    async def test_text_source_probe_chooses_blocks(self):
+        adapter = self._adapter()
+        msg = {
+            "chatMessage": {
+                "chatId": "room-a",
+                "messageId": "01HKCHF4FC4S0W7T3V74SG6AT6",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "summary": "preview",
+                "blocks": [
+                    {"content": {"case": "text", "value": {"content": "body text"}}}
+                ],
+            }
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(msg)
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one probe log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("chose=blocks", rendered)
+        self.assertIn("blocks=9", rendered)
+
+    async def test_text_source_probe_chooses_summary_when_blocks_empty(self):
+        adapter = self._adapter()
+        msg = {
+            "chatMessage": {
+                "chatId": "room-b",
+                "messageId": "01HKCHF4FC4S0W7T3V74SG6AT7",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "summary": "preview-only",
+                "blocks": [],
+            }
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(msg)
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1)
+        rendered = probe[0].getMessage()
+        self.assertIn("chose=summary", rendered)
+        self.assertIn("blocks=0", rendered)
+        self.assertIn(f"summary={len('preview-only')}", rendered)
+
+    async def test_text_source_probe_chooses_none_when_all_empty(self):
+        adapter = self._adapter()
+        msg = {
+            "chatMessage": {
+                "chatId": "room-c",
+                "messageId": "01HKCHF4FC4S0W7T3V74SG6AT8",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+            }
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(msg)
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1)
+        rendered = probe[0].getMessage()
+        self.assertIn("chose=none", rendered)
+        self.assertIn("blocks=0", rendered)
+        self.assertIn("text=0", rendered)
+        self.assertIn("summary=0", rendered)
+        # No miss candidates when every source is empty.
+        self.assertIn("miss_candidate=none", rendered)
+
+    async def test_text_source_probe_flags_miss_candidate_when_summary_longer(self):
+        """Fix C: when a non-chosen candidate is LONGER than the chosen one,
+        `miss_candidate=<name>` flags the hydration-miss signature directly
+        so operators don't have to eyeball per-field lengths.
+        """
+        adapter = self._adapter()
+        msg = {
+            "chatMessage": {
+                "chatId": "room-d",
+                "messageId": "01HKCHF4FC4S0W7T3V74SG6AT9",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "text": "short",
+                "summary": "much longer preview",
+                "blocks": [],
+            }
+        }
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(msg)
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1)
+        rendered = probe[0].getMessage()
+        self.assertIn("chose=text", rendered)
+        self.assertIn("miss_candidate=summary", rendered)
+
+
+class Probe3MessageIdTimingTests(unittest.IsolatedAsyncioTestCase):
+    """Probe (H-C): per-room message_id timing DEBUG log for post-hoc
+    burst-drop correlation. Updated BEFORE the filter chain so drops
+    still count as "what Kimi sent us" — gaps then map to burst losses.
+    """
+
+    def _adapter(self):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+        return adapter
+
+    def _msg(self, chat_id, message_id):
+        return {
+            "chatMessage": {
+                "chatId": chat_id,
+                "messageId": message_id,
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "blocks": [
+                    {"content": {"case": "text", "value": {"content": "hi"}}}
+                ],
+            }
+        }
+
+    async def test_message_id_probe_first_seen_for_new_room(self):
+        adapter = self._adapter()
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(self._msg("room-X", "01HKCHF4FC4S0W7T3V74SG6AT6"))
+        finally:
+            teardown()
+
+        probe = [r for r in records if "message_id first-seen" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one first-seen log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("room=room-X", rendered)
+        self.assertIn("id=01HKCHF4FC4S0W7T3V74SG6AT6", rendered)
+
+    async def test_message_id_probe_emits_delta_for_second_message(self):
+        adapter = self._adapter()
+        # Bump char 10 (end of the 48-bit timestamp prefix) so the two ULIDs
+        # decode to different millisecond timestamps — the random tail has
+        # no effect on the delta.
+        first_id = "01HKCHF4FC4S0W7T3V74SG6AT6"
+        second_id = "01HKCHF4FD4S0W7T3V74SG6AT6"
+        # DEBUG enabled on both dispatches so the log emission fires; the
+        # tracker update itself is hoisted OUT of the DEBUG gate (Fix A)
+        # so it populates regardless of level.
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(self._msg("room-Y", first_id))
+            first_records_len = len(records)
+            await adapter._on_group_event(self._msg("room-Y", second_id))
+        finally:
+            teardown()
+
+        # Only inspect records emitted during the second dispatch.
+        second_records = records[first_records_len:]
+        timing = [r for r in second_records if "message_id timing" in r.getMessage()]
+        self.assertEqual(len(timing), 1)
+        rendered = timing[0].getMessage()
+        self.assertIn("room=room-Y", rendered)
+        self.assertIn(f"prev={first_id}", rendered)
+        self.assertIn("delta_ms=", rendered)
+        # delta must equal the second - first timestamp diff.
+        expected_delta = _ulid_time_ms(second_id) - _ulid_time_ms(first_id)
+        self.assertIn(f"delta_ms={expected_delta}", rendered)
+        # Second dispatch must not emit a first-seen log.
+        first_seen = [r for r in second_records if "first-seen" in r.getMessage()]
+        self.assertEqual(first_seen, [])
+
+    async def test_message_id_probe_per_room_isolation(self):
+        adapter = self._adapter()
+        records, teardown = _capture_kimi_log_records()
+        try:
+            # Room A: two messages.
+            await adapter._on_group_event(self._msg("room-A", "01HKCHF4FC4S0W7T3V74SG6AT6"))
+            await adapter._on_group_event(self._msg("room-A", "01HKCHF4FD4S0W7T3V74SG6AT6"))
+            boundary = len(records)
+            # Room B: first message — must log first-seen, not a delta from A.
+            await adapter._on_group_event(self._msg("room-B", "01HKCHF4FE4S0W7T3V74SG6AT6"))
+        finally:
+            teardown()
+
+        b_records = records[boundary:]
+        first_seen = [r for r in b_records if "first-seen" in r.getMessage()]
+        timing = [r for r in b_records if "message_id timing" in r.getMessage()]
+        self.assertEqual(len(first_seen), 1, f"expected first-seen for room-B, got: {b_records}")
+        self.assertIn("room=room-B", first_seen[0].getMessage())
+        self.assertEqual(timing, [], "room-B must not emit a delta against room-A")
+
+    def test_ulid_time_ms_parses_known_ulid(self):
+        """Canonical ULID decode — cross-checked against python-ulid."""
+        # '01ARZ3NDEKTSV4RRFFQ69G5FAV' → 1469922850259 ms
+        # (2016-07-30T23:54:10.259+00:00 UTC), verified against python-ulid.
+        self.assertEqual(
+            _ulid_time_ms("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            1469922850259,
+        )
+        # Case-insensitive.
+        self.assertEqual(
+            _ulid_time_ms("01arz3ndektsv4rrffq69g5fav"),
+            1469922850259,
+        )
+        # Monotonic across two close ULIDs — later ULID has larger prefix value.
+        earlier = _ulid_time_ms("01HKCHF4FC4S0W7T3V74SG6AT6")
+        later = _ulid_time_ms("01HKCHF4FD4S0W7T3V74SG6AT6")
+        self.assertIsNotNone(earlier)
+        self.assertIsNotNone(later)
+        self.assertGreater(later, earlier)
+
+    def test_ulid_time_ms_rejects_short_or_invalid(self):
+        """None / empty / short / non-crockford → None, not a crash."""
+        self.assertIsNone(_ulid_time_ms(None))
+        self.assertIsNone(_ulid_time_ms(""))
+        self.assertIsNone(_ulid_time_ms("01ARZ3NDE"))  # 9 chars, too short
+        # 'I', 'L', 'O', 'U' are NOT in Crockford base32 — must reject.
+        self.assertIsNone(_ulid_time_ms("01IRZ3NDEK"))
+        self.assertIsNone(_ulid_time_ms("01LRZ3NDEK"))
+        self.assertIsNone(_ulid_time_ms("01ORZ3NDEK"))
+        self.assertIsNone(_ulid_time_ms("01URZ3NDEK"))
+        # Non-string input.
+        self.assertIsNone(_ulid_time_ms(12345))  # type: ignore[arg-type]
+
+    async def test_message_id_probe_tracker_populates_at_info_level(self):
+        """Fix A / Fix E invariant: tracker-update is hoisted out of the
+        DEBUG gate, so toggling DEBUG on later does NOT falsely report
+        ``first-seen`` for a message that already arrived at INFO. No
+        probe-3 log is emitted under INFO either.
+        """
+        adapter = self._adapter()
+        # Capture at WARNING (drops DEBUG) to prove the probe is silent
+        # while the tracker still fills.
+        records, teardown = _capture_kimi_log_records(level=logging.WARNING)
+        try:
+            await adapter._on_group_event(
+                self._msg("room-K", "01HKCHF4FC4S0W7T3V74SG6AT6")
+            )
+        finally:
+            teardown()
+
+        # Tracker populated regardless of log level.
+        self.assertEqual(
+            adapter._last_message_id_per_room.get("room-K"),
+            "01HKCHF4FC4S0W7T3V74SG6AT6",
+        )
+        # No probe-3 log emitted at WARNING.
+        probe = [r for r in records if "message_id" in r.getMessage()]
+        self.assertEqual(probe, [])
+
+    async def test_probes_silent_under_warning_level(self):
+        """Fix E: all three probes are DEBUG-gated — at WARNING or above,
+        zero probe records are emitted (block, text-source, or message_id).
+        """
+        adapter = self._adapter()
+        msg = {
+            "chatMessage": {
+                "chatId": "room-W",
+                "messageId": "01HKCHF4FC4S0W7T3V74SG6AT6",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "text": "envelope preview",
+                "summary": "envelope summary",
+                "blocks": [
+                    {
+                        "content": {
+                            "case": "resourceLink",
+                            "value": {"uri": "kimi://file/z"},
+                        }
+                    }
+                ],
+            }
+        }
+        records, teardown = _capture_kimi_log_records(level=logging.WARNING)
+        try:
+            await adapter._on_group_event(msg)
+        finally:
+            teardown()
+
+        probe_substrings = ("non-text block", "text source for", "message_id")
+        fired = [
+            r for r in records
+            if any(s in r.getMessage() for s in probe_substrings)
+        ]
+        self.assertEqual(fired, [], f"expected zero probe logs at WARNING, got: {fired}")
+
+    async def test_probe_msg_id_sample_rate_reduces_log_volume(self):
+        """Fix F: ``probe_msg_id_sample_rate=3`` → exactly one probe-3 log
+        every three inbound messages in the same room. Tracker still
+        updates on every inbound regardless of sampling.
+        """
+        adapter = KimiAdapter(_cfg(
+            group_allow_bot_senders="all",
+            probe_msg_id_sample_rate=3,
+        ))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+
+        ids = [
+            "01HKCHF4F14S0W7T3V74SG6AT6",
+            "01HKCHF4F24S0W7T3V74SG6AT6",
+            "01HKCHF4F34S0W7T3V74SG6AT6",
+            "01HKCHF4F44S0W7T3V74SG6AT6",
+            "01HKCHF4F54S0W7T3V74SG6AT6",
+            "01HKCHF4F64S0W7T3V74SG6AT6",
+            "01HKCHF4F74S0W7T3V74SG6AT6",
+            "01HKCHF4F84S0W7T3V74SG6AT6",
+            "01HKCHF4F94S0W7T3V74SG6AT6",
+        ]
+
+        records, teardown = _capture_kimi_log_records()
+        try:
+            for mid in ids:
+                await adapter._on_group_event(self._msg("room-S", mid))
+        finally:
+            teardown()
+
+        probe3 = [
+            r for r in records
+            if "message_id timing" in r.getMessage()
+            or "message_id first-seen" in r.getMessage()
+        ]
+        # 9 dispatches / sample_rate=3 → exactly 3 probe-3 logs.
+        self.assertEqual(
+            len(probe3), 3,
+            f"expected 3 probe-3 records at 1-in-3 sampling, got {len(probe3)}: "
+            f"{[r.getMessage() for r in probe3]}",
+        )
+        # Tracker reflects the LAST observed id, not the last SAMPLED id.
+        self.assertEqual(
+            adapter._last_message_id_per_room.get("room-S"),
+            ids[-1],
+        )
+
+    def test_probe_msg_id_sample_rate_falls_back_on_invalid_config(self):
+        """Fix-up (Codex P2): a non-numeric ``probe_msg_id_sample_rate``
+        in ``config.extra`` (e.g. operator typo ``"ten"``) must not crash
+        adapter init. Falls back to 1 with a WARNING log naming the bad
+        value.
+        """
+        records, teardown = _capture_kimi_log_records(level=logging.WARNING)
+        try:
+            adapter = KimiAdapter(_cfg(probe_msg_id_sample_rate="ten"))
+        finally:
+            teardown()
+
+        self.assertEqual(adapter._probe_msg_id_sample_rate, 1)
+        warnings = [
+            r for r in records
+            if r.levelno == logging.WARNING
+            and "probe_msg_id_sample_rate" in r.getMessage()
+        ]
+        self.assertEqual(
+            len(warnings), 1,
+            f"expected one WARNING naming the bad value, got: "
+            f"{[r.getMessage() for r in records]}",
+        )
+        self.assertIn("'ten'", warnings[0].getMessage())
 
 
 if __name__ == "__main__":

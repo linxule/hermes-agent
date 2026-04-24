@@ -424,6 +424,33 @@ def _redact_sender(short_id_or_id: Optional[str]) -> str:
     return f"{s[:4]}****"
 
 
+# Crockford base32 alphabet used by ULID (RFC: 0-9, A-Z minus I, L, O, U).
+_ULID_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_ULID_CROCKFORD_INDEX = {c: i for i, c in enumerate(_ULID_CROCKFORD)}
+
+
+def _ulid_time_ms(ulid_str: Optional[str]) -> Optional[int]:
+    """Extract the 48-bit Crockford-base32 timestamp prefix from a ULID.
+
+    Kimi message_ids follow the ULID format (first 10 chars = ms timestamp
+    in Crockford base32). Returns None if the input doesn't look like a
+    valid ULID prefix. Case-insensitive.
+
+    Used only by the Probe-3 message_id timing DEBUG log — observability
+    only, no behavioral role.
+    """
+    if not ulid_str or not isinstance(ulid_str, str) or len(ulid_str) < 10:
+        return None
+    prefix = ulid_str[:10].upper()
+    total = 0
+    for c in prefix:
+        v = _ULID_CROCKFORD_INDEX.get(c)
+        if v is None:
+            return None
+        total = total * 32 + v
+    return total
+
+
 def _block_text(block: Any) -> Optional[str]:
     if not isinstance(block, dict):
         return None
@@ -486,17 +513,58 @@ def _extract_blocks_payload(msg: Dict[str, Any]) -> Tuple[str, List[str], List[s
     media_urls: List[str] = []
     media_types: List[str] = []
 
+    # Probe (H-A): collect non-text block shapes for a post-loop DEBUG
+    # summary with envelope-length oracle fields. Observability-only —
+    # removable standalone.
+    non_text_blocks: List[Dict[str, Any]] = []
+
     blocks = msg.get("blocks") if isinstance(msg.get("blocks"), list) else []
     for block in blocks:
         text = _block_text(block)
         if text:
             text_parts.append(text)
+        elif logger.isEnabledFor(logging.DEBUG):
+            block_info: Dict[str, Any] = {}
+            if isinstance(block, dict):
+                block_info["keys"] = sorted(block.keys())
+                content = block.get("content")
+                if isinstance(content, dict):
+                    block_info["content_case"] = content.get("case")
+                    block_info["content_keys"] = sorted(content.keys())
+                block_info["has_uri"] = _resource_link_uri(block) is not None
+            else:
+                block_info["type"] = type(block).__name__
+            logger.debug(
+                "Kimi groups: non-text block (no extracted text): %r",
+                block_info,
+            )
+            non_text_blocks.append(block_info)
         uri = _resource_link_uri(block)
         if uri:
             media_urls.append(uri)
             media_types.append("resource_link")
 
     text = "\n".join(text_parts).strip()
+
+    # Probe (H-A) oracle: one summary line per message that had any
+    # non-text blocks, pairing the extracted length with the envelope
+    # preview lengths so operators can distinguish "legitimate image
+    # attachment" from "orphaned fragmented tail" without correlating
+    # against the sender's intent manually.
+    if non_text_blocks and logger.isEnabledFor(logging.DEBUG):
+        envelope_text = _field(msg, "text")
+        envelope_summary = _field(msg, "summary")
+        envelope_text_len = len(envelope_text) if isinstance(envelope_text, str) else 0
+        envelope_summary_len = (
+            len(envelope_summary) if isinstance(envelope_summary, str) else 0
+        )
+        extracted_len = sum(len(p) for p in text_parts)
+        logger.debug(
+            "Kimi groups: %d non-text block(s) — extracted_text=%d, envelope_text=%d, envelope_summary=%d, shapes=%r",
+            len(non_text_blocks), extracted_len, envelope_text_len,
+            envelope_summary_len, non_text_blocks,
+        )
+
     return text, media_urls, media_types
 
 
@@ -950,6 +1018,27 @@ class KimiAdapter(BasePlatformAdapter):
 
         # Per-room cache
         self._rooms: Dict[str, _ChatInfoCache] = {}
+
+        # Probe (H-C): per-room last-seen message_id, for DEBUG timing
+        # correlation against conductor wall-clock. Observability only —
+        # removable standalone with the Probe-3 log block.
+        self._last_message_id_per_room: Dict[str, str] = {}
+        # Probe (H-C) sample-rate knob: log 1-in-N per-room DEBUG records
+        # under busy groups so operators can cap log volume without flipping
+        # DEBUG off entirely. Default 1 (log every message — prior behavior).
+        # Tracker-update itself is NEVER sampled — every inbound populates
+        # _last_message_id_per_room so Fix A's invariant survives sampling.
+        _raw_sample_rate = config.extra.get("probe_msg_id_sample_rate", 1)
+        try:
+            self._probe_msg_id_sample_rate: int = max(1, int(_raw_sample_rate or 1))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Kimi: invalid probe_msg_id_sample_rate=%r in config.extra — "
+                "expected positive integer, falling back to 1",
+                _raw_sample_rate,
+            )
+            self._probe_msg_id_sample_rate = 1
+        self._probe_msg_id_room_counts: Dict[str, int] = {}
 
     async def connect(self) -> bool:
         """Open HTTP session, fetch bot identity, spawn channel loops.
@@ -1986,6 +2075,40 @@ class KimiAdapter(BasePlatformAdapter):
             logger.info("Kimi groups: event missing chat_id/message_id, skipping: %.200r", msg)
             return
 
+        # Probe (H-C): per-room message_id timing for post-hoc correlation
+        # against conductor wall-clock. Updated BEFORE the filter chain so
+        # self-drops, trust drops, and dedup still count as "what Kimi sent
+        # us" — burst drops would show up as gaps in this trace.
+        # Observability only — removable standalone.
+        #
+        # Tracker update is hoisted OUT of the DEBUG gate: if DEBUG is off at
+        # process start and toggled on later, we must not falsely report
+        # `first-seen` on the first post-toggle message (real bug fix).
+        room_key = str(chat_id)
+        this_id_str = str(message_id)
+        prev_id = self._last_message_id_per_room.get(room_key)
+        self._last_message_id_per_room[room_key] = this_id_str
+        if logger.isEnabledFor(logging.DEBUG):
+            # Sample-rate gate: only count + conditionally emit inside DEBUG,
+            # so INFO and above pay nothing for the per-room counter dict
+            # either.
+            count = self._probe_msg_id_room_counts.get(room_key, 0) + 1
+            self._probe_msg_id_room_counts[room_key] = count
+            if count % self._probe_msg_id_sample_rate == 0:
+                this_ts = _ulid_time_ms(this_id_str)
+                prev_ts = _ulid_time_ms(prev_id) if prev_id else None
+                if this_ts is not None and prev_ts is not None:
+                    delta_ms = this_ts - prev_ts
+                    logger.debug(
+                        "Kimi groups: message_id timing room=%s id=%s prev=%s delta_ms=%d",
+                        chat_id, message_id, prev_id, delta_ms,
+                    )
+                else:
+                    logger.debug(
+                        "Kimi groups: message_id first-seen room=%s id=%s",
+                        chat_id, message_id,
+                    )
+
         sender = msg.get("sender") or {}
         sender_id = (
             sender.get("id") if isinstance(sender, dict) else None
@@ -2025,6 +2148,49 @@ class KimiAdapter(BasePlatformAdapter):
             or _field(msg, "summary")
             or ""
         )
+        # Probe (H-B): which source populated `text`, and candidate lengths.
+        # Reveals whether `summary` ever wins over `blocks` (would be
+        # evidence Kimi ships preview-only events for long messages and
+        # our hydration gate is bypassed by a truthy short preview).
+        # Observability only — no behavior change; the fallback chain
+        # above stays exactly as-is.
+        #
+        # `miss_candidate` flags non-chosen candidates whose length exceeds
+        # the chosen one — the precise hydration-miss signature. Always
+        # emitted (value `none` when there's no miss) for grep-friendly
+        # parseability.
+        if logger.isEnabledFor(logging.DEBUG):
+            summary_val = _field(msg, "summary") or ""
+            text_val = _field(msg, "text") or ""
+            if not isinstance(text_val, str):
+                text_val = ""
+            if not isinstance(summary_val, str):
+                summary_val = ""
+            if block_text:
+                chosen = "blocks"
+            elif text_val:
+                chosen = "text"
+            elif summary_val:
+                chosen = "summary"
+            else:
+                chosen = "none"
+            candidate_lens = {
+                "blocks": len(block_text or ""),
+                "text": len(text_val),
+                "summary": len(summary_val),
+            }
+            chosen_len = 0 if chosen == "none" else candidate_lens[chosen]
+            miss_candidates = [
+                name for name, length in candidate_lens.items()
+                if name != chosen and length > chosen_len
+            ]
+            miss_str = ",".join(miss_candidates) if miss_candidates else "none"
+            logger.debug(
+                "Kimi groups: text source for %s/%s — blocks=%d, text=%d, summary=%d, chose=%s, miss_candidate=%s",
+                chat_id, message_id,
+                candidate_lens["blocks"], candidate_lens["text"],
+                candidate_lens["summary"], chosen, miss_str,
+            )
         hydrated: Optional[Dict[str, Any]] = None
         if not text and self._hydrate_missing_text:
             try:
