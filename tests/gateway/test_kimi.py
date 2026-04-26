@@ -398,6 +398,13 @@ class GroupEventParsingTests(unittest.IsolatedAsyncioTestCase):
     async def test_protobuf_json_chat_message_event_dispatches_summary(self):
         adapter = KimiAdapter(_cfg())
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: legacy summary-fallback test — disable hydration so the
+        # cascade lands on the summary path WITHOUT making a real
+        # _fetch_group_message → aiohttp call (Commit 6 made hydration
+        # the default; without this the test attempts a real network
+        # round-trip and only "passes" because the resulting transient
+        # error falls through to the same summary fallback).
+        adapter._hydrate_missing_text = False
 
         await adapter._on_group_event({
             "id": "evt-1",
@@ -414,7 +421,13 @@ class GroupEventParsingTests(unittest.IsolatedAsyncioTestCase):
 
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
-        self.assertEqual(event.text, "hello from kimi")
+        # Fix B: summary-fallback path now prepends a truncation marker
+        # so the agent knows the body is a preview, not the full message.
+        self.assertTrue(
+            event.text.startswith("[message truncated"),
+            f"expected truncation marker prefix, got: {event.text!r}",
+        )
+        self.assertIn("hello from kimi", event.text)
         self.assertEqual(event.source.chat_id, "room:chat-1")
         self.assertEqual(event.source.user_id, "user-1")
         self.assertEqual(event.source.user_name, "u1")
@@ -675,6 +688,10 @@ class GroupRpcHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_user_group_message_role_is_not_dispatched(self):
         adapter = KimiAdapter(_cfg())
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: summary-only event with hydration default-on would
+        # otherwise trigger a real _fetch_group_message → aiohttp call.
+        # Test asserts a role drop, not text content — disable hydration.
+        adapter._hydrate_missing_text = False
 
         await adapter._on_group_event({
             "chatMessage": {
@@ -735,11 +752,19 @@ def _bot_msg(**overrides) -> dict:
 
 
 class GroupTrustedSenderTests(unittest.IsolatedAsyncioTestCase):
-    """group_trusted_senders is an authoritative short_id / id allowlist."""
+    """group_trusted_senders is an authoritative short_id / id allowlist.
+
+    Fix A: ``_bot_msg()`` is summary-only (no inline blocks). With
+    hydration default-on these tests would attempt a real
+    ``_fetch_group_message`` → ``aiohttp`` call. Tests assert
+    trust/policy behavior, not text content — disable hydration on each
+    fixture.
+    """
 
     async def test_group_trusted_sender_bypasses_role_filter(self):
         adapter = KimiAdapter(_cfg(group_trusted_senders=["u_bot"]))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A — see class docstring
 
         await adapter._on_group_event(_bot_msg())
 
@@ -748,6 +773,7 @@ class GroupTrustedSenderTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_trusted_sender_by_id_also_matches(self):
         adapter = KimiAdapter(_cfg(group_trusted_senders=["assistant-1"]))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A — see class docstring
 
         # senderShortId not in allowlist; senderId IS — should still bypass.
         await adapter._on_group_event(_bot_msg(senderShortId="u_somebody_else"))
@@ -756,11 +782,18 @@ class GroupTrustedSenderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
-    """group_allow_bot_senders policy: off | trusted_only | mentions | all."""
+    """group_allow_bot_senders policy: off | trusted_only | mentions | all.
+
+    Fix A: every test in this class feeds ``_bot_msg()`` (summary-only).
+    Disable hydration so the cascade doesn't attempt a real
+    ``_fetch_group_message`` → ``aiohttp`` call when policy allows
+    dispatch.
+    """
 
     async def test_group_allow_bot_senders_off_drops_assistant(self):
         adapter = KimiAdapter(_cfg(group_allow_bot_senders="off"))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg())
 
@@ -772,6 +805,7 @@ class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
             group_trusted_senders=["u_other"],
         ))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg())
 
@@ -783,6 +817,7 @@ class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
             group_trusted_senders=["u_bot"],
         ))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg())
 
@@ -792,6 +827,7 @@ class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
         adapter = KimiAdapter(_cfg(group_allow_bot_senders="mentions"))
         adapter._me_short_id = "u_me"
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg(
             mentions=[{"short_id": "u_me"}],
@@ -803,6 +839,7 @@ class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
         adapter = KimiAdapter(_cfg(group_allow_bot_senders="mentions"))
         adapter._me_short_id = "u_me"
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg(
             mentions=[{"short_id": "u_someone_else"}],
@@ -813,6 +850,7 @@ class GroupAllowBotSendersPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_allow_bot_senders_all_allows_unconditionally(self):
         adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
         adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
 
         await adapter._on_group_event(_bot_msg())
 
@@ -866,6 +904,9 @@ class GroupPolicyLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_policy_drops_log_at_info_level(self):
         adapter = KimiAdapter(_cfg(group_allow_bot_senders="off"))
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: _bot_msg() is summary-only — disable hydration so the
+        # cascade doesn't make a real network call before the role drop.
+        adapter._hydrate_missing_text = False
 
         with self.assertLogs("gateway.platforms.kimi", level=logging.INFO) as cm:
             await adapter._on_group_event(_bot_msg())
@@ -904,6 +945,10 @@ class GroupRequireMentionSharedHelperTests(unittest.IsolatedAsyncioTestCase):
         adapter = KimiAdapter(_cfg(group_require_mention=True))
         adapter._me_short_id = "u_me"
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: events below are summary-only (no inline blocks). Disable
+        # hydration so the cascade doesn't make a real _fetch_group_message
+        # call before the mention filter runs.
+        adapter._hydrate_missing_text = False
 
         # With a proper @-mention of us via the helper's matching logic → dispatched.
         await adapter._on_group_event({
@@ -945,6 +990,7 @@ class GroupRequireMentionSharedHelperTests(unittest.IsolatedAsyncioTestCase):
         ))
         adapter2._me_short_id = "u_me"
         adapter2.handle_message = AsyncMock()  # type: ignore
+        adapter2._hydrate_missing_text = False  # Fix A — _bot_msg is summary-only
         await adapter2._on_group_event(_bot_msg(
             mentions=[{"short_id": "u_me"}],
         ))
@@ -963,6 +1009,9 @@ class ThreadRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_inbound_thread_chat_id_preserved(self):
         adapter = KimiAdapter(_cfg())
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: summary-only event — disable hydration so routing assertions
+        # don't depend on a real network call.
+        adapter._hydrate_missing_text = False
 
         await adapter._on_group_event({
             "chatMessage": {
@@ -985,6 +1034,9 @@ class ThreadRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_inbound_no_thread_chat_id_room_only(self):
         adapter = KimiAdapter(_cfg())
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: summary-only event — disable hydration so routing assertions
+        # don't depend on a real network call.
+        adapter._hydrate_missing_text = False
 
         await adapter._on_group_event({
             "chatMessage": {
@@ -1695,6 +1747,9 @@ class TrustedOnlyDropLogLevelTests(unittest.IsolatedAsyncioTestCase):
             group_trusted_senders=["u_someone_else"],
         ))
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: _bot_msg() is summary-only — disable hydration so the
+        # cascade doesn't hit the network before the redacted-drop log fires.
+        adapter._hydrate_missing_text = False
 
         # Use a realistic-looking short_id so we can assert that the
         # redaction preserves only the prefix + first 4 body chars.
@@ -1724,6 +1779,8 @@ class TrustedOnlyDropLogLevelTests(unittest.IsolatedAsyncioTestCase):
             group_trusted_senders=["u_someone_else"],
         ))
         adapter.handle_message = AsyncMock()  # type: ignore
+        # Fix A: _bot_msg() is summary-only — disable hydration.
+        adapter._hydrate_missing_text = False
 
         msg = _bot_msg(senderShortId=None, senderId="assistant-long-id-xyz")
 
@@ -2252,6 +2309,10 @@ class Probe2TextSourceTests(unittest.IsolatedAsyncioTestCase):
         rendered = probe[0].getMessage()
         self.assertIn("chose=blocks", rendered)
         self.assertIn("blocks=9", rendered)
+        # Inline body present → hydration check short-circuits to
+        # `skipped:inline` regardless of the _hydrate_missing_text flag
+        # (Fix C distinguishes "not needed" from "operator policy off").
+        self.assertIn("hydrated=skipped:inline", rendered)
 
     async def test_text_source_probe_chooses_summary_when_blocks_empty(self):
         adapter = self._adapter()
@@ -2279,6 +2340,10 @@ class Probe2TextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("chose=summary", rendered)
         self.assertIn("blocks=0", rendered)
         self.assertIn(f"summary={len('preview-only')}", rendered)
+        # Hydration disabled by fixture (`_hydrate_missing_text=False`) →
+        # `skipped:disabled` distinguishes operator policy from "inline
+        # body present, hydration not needed" (Fix C).
+        self.assertIn("hydrated=skipped:disabled", rendered)
 
     async def test_text_source_probe_chooses_none_when_all_empty(self):
         adapter = self._adapter()
@@ -2307,6 +2372,9 @@ class Probe2TextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("summary=0", rendered)
         # No miss candidates when every source is empty.
         self.assertIn("miss_candidate=none", rendered)
+        # Fix C: `skipped:disabled` (not generic `skipped`) when the
+        # hydration flag is off.
+        self.assertIn("hydrated=skipped:disabled", rendered)
 
     async def test_text_source_probe_flags_miss_candidate_when_summary_longer(self):
         """Fix C: when a non-chosen candidate is LONGER than the chosen one,
@@ -2338,6 +2406,295 @@ class Probe2TextSourceTests(unittest.IsolatedAsyncioTestCase):
         rendered = probe[0].getMessage()
         self.assertIn("chose=text", rendered)
         self.assertIn("miss_candidate=summary", rendered)
+        # Inline body present (text=short) → `skipped:inline` (Fix C),
+        # not `skipped:disabled` — the flag is off in this fixture but
+        # the inline-present check short-circuits first.
+        self.assertIn("hydrated=skipped:inline", rendered)
+
+
+class HydrateWhenInlineBodyEmptyTests(unittest.IsolatedAsyncioTestCase):
+    """H-B fix (Commit 6): when Subscribe ships ``blocks=[]`` and no inline
+    ``text`` but a non-empty ``summary`` preview, hydrate from
+    ``ListMessages`` rather than dispatching the truncated preview to the
+    agent. Summary remains as a last-resort fallback if hydration fails.
+
+    Production trigger (2026-04-26 11:21:36 BST): Probe 2 captured
+    ``blocks=0, text=0, summary=50, chose=summary, miss_candidate=none``
+    for a ~150-char inbound; agent answered against the 50-char preview.
+    """
+
+    def _summary_only_event(self, *, chat_id="chat-hb", message_id="msg-hb",
+                            summary="this is a 50-char-ish truncated server-side preview"):
+        return {
+            "chatMessage": {
+                "chatId": chat_id,
+                "messageId": message_id,
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "summary": summary,
+                "blocks": [],
+            }
+        }
+
+    async def test_summary_only_event_triggers_hydration(self):
+        """Empty blocks + empty text + populated summary + hydration enabled
+        → ``_fetch_group_message`` called exactly once with the chat/message
+        ids from the event.
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        # Default is True; assert explicitly to make the contract visible.
+        self.assertTrue(adapter._hydrate_missing_text)
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-hb",
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": "full body"}}}
+            ],
+        })  # type: ignore
+
+        await adapter._on_group_event(self._summary_only_event())
+
+        adapter._fetch_group_message.assert_awaited_once_with("chat-hb", "msg-hb")
+
+    async def test_hydrated_body_wins_over_summary(self):
+        """Dispatched ``MessageEvent.text`` matches the hydrated body, not
+        the summary preview — the whole point of the H-B fix.
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        full_body = (
+            "please reply with the literal word pineapple so the operator "
+            "can verify full delivery (this is a ~150 char message)"
+        )
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-hb",
+            "senderId": "u1",
+            "senderShortId": "u_real",
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": full_body}}}
+            ],
+        })  # type: ignore
+
+        await adapter._on_group_event(
+            self._summary_only_event(summary="please reply with the literal word…")
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        self.assertEqual(delivered.text, full_body)
+        self.assertNotIn("…", delivered.text)
+
+    async def test_hydration_failure_falls_back_to_summary(self):
+        """When hydration raises ``KimiAdapterError`` (transient infra blip)
+        we still dispatch with the summary text rather than dropping the
+        message entirely. Graceful degradation — better-than-nothing.
+
+        Fix B: summary fallback now prepends a truncation marker so the
+        agent can acknowledge the body is a preview rather than answer
+        confidently against half a sentence (same H-B failure mode as
+        the original bug, just less frequent).
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        summary = "preview-only fallback text"
+        adapter._fetch_group_message = AsyncMock(
+            side_effect=KimiRpcError("hydration failed")
+        )  # type: ignore
+
+        await adapter._on_group_event(self._summary_only_event(summary=summary))
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        self.assertTrue(
+            delivered.text.startswith("[message truncated"),
+            f"expected truncation marker prefix, got: {delivered.text!r}",
+        )
+        self.assertTrue(
+            delivered.text.endswith(summary),
+            f"expected summary at tail, got: {delivered.text!r}",
+        )
+
+    async def test_hydration_skipped_when_inline_text_present(self):
+        """Happy path: inline blocks/text present → no hydration RPC even
+        if a summary also exists. Guards against re-introducing per-event
+        ``ListMessages`` overhead in the common case.
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock()  # type: ignore
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-happy",
+                "messageId": "msg-happy",
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "summary": "preview",
+                "blocks": [
+                    {"content": {"case": "text", "value": {"content": "inline body"}}}
+                ],
+            }
+        })
+
+        adapter._fetch_group_message.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        self.assertEqual(delivered.text, "inline body")
+
+    async def test_probe2_logs_hydrated_field(self):
+        """Probe 2 reports ``hydrated=true`` and ``chose=hydrated`` when
+        a summary-only inbound is successfully hydrated. Confirms the
+        observability surface tracks the new control flow.
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        full_body = "the actual full body fetched via ListMessages"
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-hb",
+            "blocks": [
+                {"content": {"case": "text", "value": {"content": full_body}}}
+            ],
+        })  # type: ignore
+
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(
+                self._summary_only_event(summary="short preview")
+            )
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one probe log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("hydrated=true", rendered)
+        self.assertIn("chose=hydrated", rendered)
+        # Original raw-event candidates: blocks=0 text=0 summary>0.
+        self.assertIn("blocks=0", rendered)
+        self.assertIn("text=0", rendered)
+
+    async def test_summary_fallback_includes_truncation_marker(self):
+        """Fix B: hydration failure → summary fallback path prepends a
+        clear truncation marker so the agent knows the body is a preview
+        and can acknowledge rather than confidently answer against half
+        a sentence. Same H-B failure mode as the original bug — just less
+        frequent now that hydration is the primary path.
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        summary = "this is the 50-char-ish truncated server-side preview"
+        adapter._fetch_group_message = AsyncMock(
+            side_effect=KimiRpcError("hydration unavailable")
+        )  # type: ignore
+
+        await adapter._on_group_event(self._summary_only_event(summary=summary))
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        self.assertTrue(
+            delivered.text.startswith("[message truncated"),
+            f"expected truncation marker prefix, got: {delivered.text!r}",
+        )
+        self.assertIn(summary, delivered.text)
+
+    async def test_probe2_logs_hydrated_skipped_disabled_when_flag_off(self):
+        """Fix C: ``_hydrate_missing_text=False`` → ``hydrated=skipped:disabled``
+        in Probe 2 (operator policy distinguishable from "inline body
+        present, hydration not needed").
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # operator policy: no hydration
+        # _fetch_group_message intentionally NOT mocked: with the flag off
+        # it must never be invoked.
+
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(
+                self._summary_only_event(summary="short preview")
+            )
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one probe log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("hydrated=skipped:disabled", rendered)
+        self.assertNotIn("hydrated=skipped:inline", rendered)
+
+    async def test_probe2_logs_hydrated_skipped_inline_when_inline_text_present(self):
+        """Fix C: inline body present (non-empty blocks/text) →
+        ``hydrated=skipped:inline``, regardless of the
+        ``_hydrate_missing_text`` flag. Distinguishes "happy path, no
+        hydration needed" from "operator turned hydration off".
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._fetch_group_message = AsyncMock()  # type: ignore
+
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event({
+                "chatMessage": {
+                    "chatId": "chat-inline",
+                    "messageId": "msg-inline",
+                    "status": "STATUS_COMPLETED",
+                    "role": "ROLE_USER",
+                    "senderId": "u1",
+                    "senderShortId": "u_real",
+                    "summary": "preview",
+                    "blocks": [
+                        {"content": {"case": "text", "value": {"content": "inline body"}}}
+                    ],
+                }
+            })
+        finally:
+            teardown()
+
+        adapter._fetch_group_message.assert_not_awaited()
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one probe log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("hydrated=skipped:inline", rendered)
+        self.assertNotIn("hydrated=skipped:disabled", rendered)
+
+    async def test_probe2_logs_hydrated_false_when_hydration_returns_empty_payload(self):
+        """Fix E: hydration returns a truthy-but-empty payload (e.g. wrapper
+        with no blocks/text) → ``hydrated=false``, NOT ``hydrated=true``.
+        Prior shape set ``hydrated=true`` whenever the hydrated dict was
+        truthy, before checking whether ``_extract_blocks_payload`` actually
+        yielded text — Probe 2 then falsely claimed a hydration win on an
+        empty payload.
+
+        Falls through to summary fallback (Fix B annotated).
+        """
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all"))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        # Truthy but yields no text — wrapper-only payload.
+        adapter._fetch_group_message = AsyncMock(return_value={
+            "id": "msg-hb",
+            "blocks": [],
+        })  # type: ignore
+
+        records, teardown = _capture_kimi_log_records()
+        try:
+            await adapter._on_group_event(
+                self._summary_only_event(summary="short preview")
+            )
+        finally:
+            teardown()
+
+        probe = [r for r in records if "text source for" in r.getMessage()]
+        self.assertEqual(len(probe), 1, f"expected one probe log, got: {probe}")
+        rendered = probe[0].getMessage()
+        self.assertIn("hydrated=false", rendered)
+        self.assertNotIn("hydrated=true", rendered)
+        # Cascade then falls through to Fix B's annotated summary.
+        self.assertIn("chose=summary", rendered)
 
 
 class Probe3MessageIdTimingTests(unittest.IsolatedAsyncioTestCase):

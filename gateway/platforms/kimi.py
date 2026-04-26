@@ -2142,57 +2142,56 @@ class KimiAdapter(BasePlatformAdapter):
 
         block_text, media_urls, media_types = _extract_blocks_payload(msg)
         message_role = _field(msg, "role", "messageRole", "message_role")
-        text = (
-            block_text
-            or _field(msg, "text")
-            or _field(msg, "summary")
-            or ""
-        )
-        # Probe (H-B): which source populated `text`, and candidate lengths.
-        # Reveals whether `summary` ever wins over `blocks` (would be
-        # evidence Kimi ships preview-only events for long messages and
-        # our hydration gate is bypassed by a truthy short preview).
-        # Observability only — no behavior change; the fallback chain
-        # above stays exactly as-is.
+
+        # Resolve text in three stages:
+        #   1. inline body (blocks → text field) from the Subscribe event
+        #   2. hydration if inline body is empty (Subscribe sometimes ships
+        #      preview-only events for long messages — empty blocks/text and
+        #      a truncated `summary`)
+        #   3. summary as a last-resort fallback for graceful degradation
         #
-        # `miss_candidate` flags non-chosen candidates whose length exceeds
-        # the chosen one — the precise hydration-miss signature. Always
-        # emitted (value `none` when there's no miss) for grep-friendly
-        # parseability.
-        if logger.isEnabledFor(logging.DEBUG):
-            summary_val = _field(msg, "summary") or ""
-            text_val = _field(msg, "text") or ""
-            if not isinstance(text_val, str):
-                text_val = ""
-            if not isinstance(summary_val, str):
-                summary_val = ""
-            if block_text:
-                chosen = "blocks"
-            elif text_val:
-                chosen = "text"
-            elif summary_val:
-                chosen = "summary"
-            else:
-                chosen = "none"
-            candidate_lens = {
-                "blocks": len(block_text or ""),
-                "text": len(text_val),
-                "summary": len(summary_val),
-            }
-            chosen_len = 0 if chosen == "none" else candidate_lens[chosen]
-            miss_candidates = [
-                name for name, length in candidate_lens.items()
-                if name != chosen and length > chosen_len
-            ]
-            miss_str = ",".join(miss_candidates) if miss_candidates else "none"
-            logger.debug(
-                "Kimi groups: text source for %s/%s — blocks=%d, text=%d, summary=%d, chose=%s, miss_candidate=%s",
-                chat_id, message_id,
-                candidate_lens["blocks"], candidate_lens["text"],
-                candidate_lens["summary"], chosen, miss_str,
-            )
+        # H-B fix (2026-04-26): the prior fallback chain
+        #     text = block_text or text_field or summary or ""
+        # treated `summary` as equivalent to inline body, so a truthy
+        # 50-char preview bypassed the `if not text` hydration gate and
+        # the agent only ever saw the truncated server-side preview.
+        # We now gate hydration on inline body being empty regardless of
+        # summary, and only fall through to summary if hydration is
+        # unavailable or fails. Production confirmation: Probe 2 log at
+        # 2026-04-26 11:21:36 BST showed
+        #   blocks=0, text=0, summary=50, chose=summary, miss_candidate=none
+        # for a ~150-char inbound message, with the agent answering against
+        # the 50-char preview rather than the full body.
+        text_field = _field(msg, "text") or ""
+        if not isinstance(text_field, str):
+            text_field = ""
+        summary_field = _field(msg, "summary") or ""
+        if not isinstance(summary_field, str):
+            summary_field = ""
+        inline_text = block_text or text_field
+        text = inline_text
+
         hydrated: Optional[Dict[str, Any]] = None
-        if not text and self._hydrate_missing_text:
+        # `hydration_state` drives Probe 2's `hydrated=` field. Five values
+        # so operators can distinguish operationally distinct states when
+        # debugging "why didn't hydration fire / what did it produce":
+        #   skipped:inline   — inline body present, hydration not needed
+        #   skipped:disabled — _hydrate_missing_text=False (operator policy)
+        #   true             — hydration ran AND populated text non-empty
+        #   false            — hydration ran but raised, returned empty,
+        #                      or returned a payload that yielded no text
+        #
+        # `text_from_hydration` is the authoritative "did hydration provide
+        # the chosen text?" flag — Probe 2 uses it instead of string-equality
+        # against summary, so a hydrated body that happens to equal the
+        # summary preview verbatim is still correctly labeled `chose=hydrated`.
+        text_from_hydration = False
+        if inline_text:
+            hydration_state = "skipped:inline"
+        elif not self._hydrate_missing_text:
+            hydration_state = "skipped:disabled"
+        else:
+            hydration_state = "false"
             try:
                 hydrated = await self._fetch_group_message(str(chat_id), str(message_id))
             except KimiAdapterError as exc:
@@ -2207,12 +2206,15 @@ class KimiAdapter(BasePlatformAdapter):
                     hydrated_text, hydrated_urls, hydrated_types = _extract_blocks_payload(
                         hydrated
                     )
-                    text = (
-                        hydrated_text
-                        or _field(hydrated, "text")
-                        or _field(hydrated, "summary")
-                        or text
-                    )
+                    new_text = hydrated_text or _field(hydrated, "text") or ""
+                    if new_text:
+                        text = new_text
+                        text_from_hydration = True
+                        hydration_state = "true"
+                    # else: hydrated payload was truthy but yielded no text
+                    # (e.g. wrapper-only). Keep hydration_state="false" so
+                    # Probe 2 doesn't claim a hydration win on an empty
+                    # payload (Codex MINOR #2 — Fix E).
                     media_urls.extend(url for url in hydrated_urls if url not in media_urls)
                     media_types.extend(hydrated_types)
                     sender_id = sender_id or _field(hydrated, "senderId", "sender_id")
@@ -2225,6 +2227,75 @@ class KimiAdapter(BasePlatformAdapter):
                     message_role = message_role or _field(
                         hydrated, "role", "messageRole", "message_role"
                     )
+
+        # Final fallback: hydration unavailable, failed, or returned an
+        # empty body → use summary as better-than-nothing so the agent
+        # at least sees SOMETHING. Without this, a degraded Kimi backend
+        # would silently drop messages we could have shown a preview of.
+        # Annotate so the agent knows the body is truncated and can
+        # acknowledge rather than confidently answer against half a
+        # sentence (Fix B — same H-B failure mode as the original bug,
+        # just less frequent).
+        if not text and summary_field:
+            text = (
+                "[message truncated — full text unavailable, "
+                "preview only]\n"
+                + summary_field
+            )
+
+        # Probe (H-B): which source populated `text`, candidate lengths,
+        # and whether hydration ran. Logged after the full resolution
+        # cascade so the chosen source reflects the final outcome
+        # (blocks / text / hydrated / summary / none).
+        #
+        # `miss_candidate` flags non-chosen *raw-event* candidates whose
+        # length exceeds the chosen one — the precise hydration-miss
+        # signature. After the H-B fix this should never report
+        # `chose=summary, miss_candidate=none` for a long inbound; if it
+        # does, hydration was disabled or failed silently.
+        if logger.isEnabledFor(logging.DEBUG):
+            # Order matters: hydration check before block/text comparisons
+            # would mislabel a hydrated body that equals the inline candidate
+            # verbatim. Inline candidates win when they actually populated
+            # the chosen text (text_from_hydration is False in that case).
+            if text_from_hydration:
+                chosen = "hydrated"
+            elif block_text and text == block_text:
+                chosen = "blocks"
+            elif text_field and text == text_field:
+                chosen = "text"
+            elif summary_field and summary_field in (text or ""):
+                # Fix B prepends a truncation marker, so `text` is no
+                # longer == summary_field — use containment.
+                chosen = "summary"
+            else:
+                chosen = "none"
+            candidate_lens = {
+                "blocks": len(block_text or ""),
+                "text": len(text_field),
+                "summary": len(summary_field),
+            }
+            # Length oracle covers raw-event candidates only; `hydrated`
+            # is reported via the `hydrated=` field rather than length
+            # (the hydrated payload may itself be a wrapper of arbitrary
+            # shape and isn't directly comparable to inline candidates).
+            if chosen in candidate_lens:
+                chosen_len = candidate_lens[chosen]
+            else:
+                # `hydrated` or `none` — compare misses against the chosen
+                # text's length so a longer inline candidate still flags.
+                chosen_len = len(text or "")
+            miss_candidates = [
+                name for name, length in candidate_lens.items()
+                if name != chosen and length > chosen_len
+            ]
+            miss_str = ",".join(miss_candidates) if miss_candidates else "none"
+            logger.debug(
+                "Kimi groups: text source for %s/%s — blocks=%d, text=%d, summary=%d, chose=%s, hydrated=%s, miss_candidate=%s",
+                chat_id, message_id,
+                candidate_lens["blocks"], candidate_lens["text"],
+                candidate_lens["summary"], chosen, hydration_state, miss_str,
+            )
 
         if sender_id and self._me_id and sender_id == self._me_id:
             return
