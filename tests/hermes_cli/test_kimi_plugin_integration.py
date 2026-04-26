@@ -283,10 +283,25 @@ class TestKimiPluginEnd2End:
             "autouse fixture failed to reset."
         )
 
-        # Make check_kimi_requirements pass without forcing a real env var.
+        # The in-tree branch at gateway/run.py:2982-2987 does
+        #   ``from gateway.platforms.kimi import KimiAdapter, check_kimi_requirements``
+        # importing the *shim*. The shim re-exports the moved symbols via
+        #   ``from plugins.kimi.kimi_adapter import KimiAdapter, check_kimi_requirements``
+        # at gateway/platforms/kimi.py:6. That re-export creates a fresh binding
+        # ``gateway.platforms.kimi.check_kimi_requirements`` that points at the
+        # ORIGINAL function object, frozen at shim-import time.
+        #
+        # Patching ``plugins.kimi.kimi_adapter.check_kimi_requirements`` would
+        # rebind only the source module's attribute, leaving the shim's binding
+        # (the one the in-tree branch actually uses) pointing at the original.
+        # The test would pass vacuously because the real check_kimi_requirements
+        # only checks for ``websockets``+``aiohttp`` libs (both installed in the
+        # test env) and returns True regardless. Patching the shim's binding
+        # directly is the only way to prove the test exercises what it claims.
+        from unittest.mock import MagicMock
+        fake_check = MagicMock(return_value=True)
         monkeypatch.setattr(
-            "plugins.kimi.kimi_adapter.check_kimi_requirements",
-            lambda: True,
+            "gateway.platforms.kimi.check_kimi_requirements", fake_check
         )
 
         from gateway.config import Platform, PlatformConfig
@@ -302,6 +317,13 @@ class TestKimiPluginEnd2End:
         cfg = PlatformConfig(enabled=True)
         adapter = runner._create_adapter(Platform.KIMI, cfg)
 
+        # Invocation assertion: prove the in-tree branch actually consulted
+        # our patched check, rather than passing for an unrelated reason.
+        assert fake_check.called, (
+            "In-tree fallback should have invoked check_kimi_requirements "
+            "via the gateway.platforms.kimi shim; the monkeypatch did not "
+            "reach the binding the in-tree branch sees."
+        )
         assert adapter is not None, (
             "In-tree fallback must construct a KimiAdapter when the plugin "
             "is not enabled and requirements pass."
