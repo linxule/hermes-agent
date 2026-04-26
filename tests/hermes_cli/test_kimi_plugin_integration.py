@@ -40,11 +40,11 @@ def _clear_platform_factory_registry():
     """
     from gateway.platforms import registry
 
-    registry._FACTORIES.clear()
+    registry._reset_for_tests()
     try:
         yield
     finally:
-        registry._FACTORIES.clear()
+        registry._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -263,3 +263,51 @@ class TestKimiPluginEnd2End:
 
         assert shim.KimiAdapter is plugin_module.KimiAdapter
         assert shim.check_kimi_requirements is plugin_module.check_kimi_requirements
+
+    def test_in_tree_fallback_when_plugin_disabled(self, hermes_home, monkeypatch):
+        """When the plugin is NOT enabled, ``_create_adapter`` falls through to
+        the in-tree ``elif Platform.KIMI`` branch in ``gateway/run.py``.
+
+        This is the safety net that keeps Bloom/Mimi running if a deployment
+        forgets to opt in via ``plugins.enabled: [kimi]``. Without this test,
+        the deletion of the in-tree branch (planned post-soak) could go
+        unnoticed and break deployments that still rely on the fallback.
+        """
+        # Do NOT call _enable_kimi_plugin(hermes_home) — plugins.enabled is empty.
+        # Do NOT call PluginManager.discover_and_load — the registry stays empty.
+
+        # Confirm the registry really is empty (autouse fixture should ensure this).
+        from gateway.platforms import registry
+        assert registry._FACTORIES == {}, (
+            "Registry should be empty in the in-tree-fallback path; "
+            "autouse fixture failed to reset."
+        )
+
+        # Make check_kimi_requirements pass without forcing a real env var.
+        monkeypatch.setattr(
+            "plugins.kimi.kimi_adapter.check_kimi_requirements",
+            lambda: True,
+        )
+
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+        from plugins.kimi.kimi_adapter import KimiAdapter
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = types.SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+
+        cfg = PlatformConfig(enabled=True)
+        adapter = runner._create_adapter(Platform.KIMI, cfg)
+
+        assert adapter is not None, (
+            "In-tree fallback must construct a KimiAdapter when the plugin "
+            "is not enabled and requirements pass."
+        )
+        # The shim re-exports the plugin module's class, so the in-tree path
+        # and the plugin path resolve to the *same* class object (the one
+        # that lives in `plugins.kimi.kimi_adapter`). This is the documented
+        # dual-path module identity tradeoff.
+        assert isinstance(adapter, KimiAdapter)

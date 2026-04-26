@@ -87,11 +87,11 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 def _clear_platform_factory_registry():
     from gateway.platforms import registry
 
-    registry._FACTORIES.clear()
+    registry._reset_for_tests()
     try:
         yield
     finally:
-        registry._FACTORIES.clear()
+        registry._reset_for_tests()
 
 
 class FakePlatformAdapter(BasePlatformAdapter):
