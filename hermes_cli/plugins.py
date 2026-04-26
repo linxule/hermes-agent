@@ -496,6 +496,57 @@ class PluginContext:
             self.manifest.name, qualified,
         )
 
+    def register_platform_adapter(
+        self,
+        platform: Any,
+        factory: Callable,
+        requirements_check: Optional[Callable] = None,
+    ) -> None:
+        """Register a platform adapter factory provided by this plugin.
+
+        ``platform`` must be a ``gateway.config.Platform`` enum value.
+        ``factory`` is called with a ``PlatformConfig`` and must return a
+        ``BasePlatformAdapter`` instance. ``requirements_check`` is an
+        optional zero-arg callable returning ``bool`` — if it returns
+        ``False`` at adapter-creation time the gateway logs a warning and
+        skips this platform.
+
+        Mirrors the ``image_gen`` provider registration pattern: invalid
+        arguments are logged and ignored rather than raised so a single
+        misconfigured plugin can't crash gateway startup.
+        """
+        from gateway.config import Platform
+        from gateway.platforms.registry import register_platform_factory
+
+        if not isinstance(platform, Platform):
+            logger.warning(
+                "Plugin '%s' tried to register a platform adapter with "
+                "platform=%r (type %s). Expected a gateway.config.Platform "
+                "enum value. Ignoring.",
+                self.manifest.name, platform, type(platform).__name__,
+            )
+            return
+        if not callable(factory):
+            logger.warning(
+                "Plugin '%s' tried to register a platform adapter for %s "
+                "with a non-callable factory (type %s). Ignoring.",
+                self.manifest.name, platform.value, type(factory).__name__,
+            )
+            return
+        if requirements_check is not None and not callable(requirements_check):
+            logger.warning(
+                "Plugin '%s' tried to register a platform adapter for %s "
+                "with a non-callable requirements_check (type %s). Ignoring.",
+                self.manifest.name, platform.value,
+                type(requirements_check).__name__,
+            )
+            return
+        register_platform_factory(platform, factory, requirements_check)
+        logger.info(
+            "Plugin '%s' registered platform adapter: %s",
+            self.manifest.name, platform.value,
+        )
+
 
 # ---------------------------------------------------------------------------
 # PluginManager
