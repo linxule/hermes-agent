@@ -96,6 +96,50 @@ elif platform == Platform.YOUR_PLATFORM:
 
 ---
 
+## 3a. Plugin-distributed adapters (alternative to section 3)
+
+For adapters distributed as standalone plugins — community or third-party
+work, niche platforms, experimental adapters maintained outside the upstream
+tree — there is a shorter registration path that does not require editing
+`_create_adapter()`.
+
+Your plugin's `register()` function calls
+`ctx.register_platform_adapter(...)` from `hermes_cli/plugins.py`:
+
+```python
+# In your plugin's __init__.py
+from gateway.config import Platform
+from .your_adapter import YourAdapter, check_your_requirements
+
+def register(ctx):
+    ctx.register_platform_adapter(
+        Platform.YOUR_PLATFORM,
+        lambda config: YourAdapter(config),
+        requirements_check=check_your_requirements,
+    )
+```
+
+The plugin registry (`gateway/platforms/registry.py`) is consulted at the
+top of `_create_adapter()`, before the in-tree if/elif chain. A plugin
+factory therefore takes precedence over an in-tree branch for the same
+`Platform` value — useful when a plugin needs to override a built-in
+adapter, harmless otherwise because the `Platform` enum is closed.
+
+Caveats:
+
+- **Section 2 (Platform enum) still requires an upstream commit.** The
+  `Platform` enum is intentionally closed; new platform values must land
+  in `gateway/config.py`. This is usually a one-line change accepted as
+  part of the plugin's introduction.
+- **All other sections (4 onwards) apply identically.** Authorization
+  maps, session source fields, system prompt hints, toolset entries,
+  etc. — same regardless of distribution method.
+
+See `gateway/platforms/registry.py` for the registry's full interface
+and `tests/hermes_cli/test_plugins.py` for registration examples.
+
+---
+
 ## 4. Authorization Maps (`gateway/run.py`)
 
 Add to BOTH dicts in `_is_user_authorized()`:
