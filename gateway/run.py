@@ -3030,6 +3030,15 @@ class GatewayRunner:
                 getattr(self.config, "thread_sessions_per_user", False),
             )
 
+        from gateway.platforms.registry import lookup_platform_factory
+        entry = lookup_platform_factory(platform)
+        if entry is not None:
+            factory, check = entry
+            if check is not None and not check():
+                logger.warning("%s: requirements not met (plugin)", platform.value)
+                return None
+            return factory(config)
+
         if platform == Platform.TELEGRAM:
             from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
             if not check_telegram_requirements():

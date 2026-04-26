@@ -24,6 +24,7 @@ from hermes_cli.plugins import (
     discover_plugins,
     invoke_hook,
 )
+from gateway.platforms.base import BasePlatformAdapter
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -80,6 +81,165 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
         cfg_path.write_text(yaml.safe_dump(cfg))
 
     return plugin_dir
+
+
+@pytest.fixture(autouse=True)
+def _clear_platform_factory_registry():
+    from gateway.platforms import registry
+
+    registry._FACTORIES.clear()
+    try:
+        yield
+    finally:
+        registry._FACTORIES.clear()
+
+
+class FakePlatformAdapter(BasePlatformAdapter):
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
+class TestPluginPlatformAdapterRegistry:
+    """Tests for plugin platform adapter registration."""
+
+    def test_register_platform_adapter_adds_factory_to_registry(self):
+        from gateway.config import Platform
+        from gateway.platforms.registry import lookup_platform_factory
+
+        ctx = PluginContext(PluginManifest(name="platform_plugin"), PluginManager())
+
+        def fake_factory(config):
+            return FakePlatformAdapter(config, Platform.LOCAL)
+
+        ctx.register_platform_adapter(Platform.LOCAL, fake_factory)
+
+        entry = lookup_platform_factory(Platform.LOCAL)
+        assert entry is not None
+        factory, check = entry
+        assert factory is fake_factory
+        assert check is None
+
+    def test_create_adapter_uses_registered_platform_factory(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        fake_config = PlatformConfig(enabled=True)
+        fake_adapter = FakePlatformAdapter(fake_config, Platform.LOCAL)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = types.SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+
+        ctx = PluginContext(PluginManifest(name="platform_plugin"), PluginManager())
+        ctx.register_platform_adapter(Platform.LOCAL, lambda config: fake_adapter)
+
+        adapter = runner._create_adapter(Platform.LOCAL, fake_config)
+
+        assert adapter is fake_adapter
+
+    def test_create_adapter_skips_registered_factory_when_requirements_fail(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        fake_config = PlatformConfig(enabled=True)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = types.SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+
+        ctx = PluginContext(PluginManifest(name="platform_plugin"), PluginManager())
+        ctx.register_platform_adapter(
+            Platform.LOCAL,
+            lambda config: FakePlatformAdapter(config, Platform.LOCAL),
+            requirements_check=lambda: False,
+        )
+
+        adapter = runner._create_adapter(Platform.LOCAL, fake_config)
+
+        assert adapter is None
+
+    def test_register_platform_adapter_rejects_non_enum_platform(self, caplog):
+        """Plugin passing a string instead of Platform enum is logged + ignored."""
+        from gateway.config import Platform
+        from gateway.platforms.registry import lookup_platform_factory
+
+        ctx = PluginContext(PluginManifest(name="bad_plugin"), PluginManager())
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            ctx.register_platform_adapter("kimi", lambda config: None)
+
+        assert lookup_platform_factory(Platform.LOCAL) is None
+        assert any(
+            "Expected a gateway.config.Platform enum value" in r.message
+            for r in caplog.records
+        )
+
+    def test_register_platform_adapter_rejects_non_callable_factory(self, caplog):
+        """Plugin passing a non-callable factory is logged + ignored."""
+        from gateway.config import Platform
+        from gateway.platforms.registry import lookup_platform_factory
+
+        ctx = PluginContext(PluginManifest(name="bad_plugin"), PluginManager())
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            ctx.register_platform_adapter(Platform.LOCAL, "not_callable")
+
+        assert lookup_platform_factory(Platform.LOCAL) is None
+        assert any(
+            "non-callable factory" in r.message for r in caplog.records
+        )
+
+    def test_register_platform_factory_overwrites_with_warning(self, caplog):
+        """Re-registering same Platform overwrites previous + logs warning."""
+        from gateway.config import Platform
+        from gateway.platforms.registry import (
+            lookup_platform_factory,
+            register_platform_factory,
+        )
+
+        def factory_a(config):
+            return FakePlatformAdapter(config, Platform.LOCAL)
+
+        def factory_b(config):
+            return FakePlatformAdapter(config, Platform.LOCAL)
+
+        register_platform_factory(Platform.LOCAL, factory_a)
+        with caplog.at_level(logging.WARNING, logger="gateway.platforms.registry"):
+            register_platform_factory(Platform.LOCAL, factory_b)
+
+        entry = lookup_platform_factory(Platform.LOCAL)
+        assert entry is not None
+        assert entry[0] is factory_b
+        assert any(
+            "re-registered" in r.message for r in caplog.records
+        )
+
+    def test_register_platform_factory_raises_on_invalid_types(self):
+        """Direct registry call with invalid types raises TypeError."""
+        from gateway.config import Platform
+        from gateway.platforms.registry import register_platform_factory
+
+        with pytest.raises(TypeError, match="Platform enum value"):
+            register_platform_factory("not_a_platform", lambda c: None)
+
+        with pytest.raises(TypeError, match="callable factory"):
+            register_platform_factory(Platform.LOCAL, "not_callable")
+
+        with pytest.raises(TypeError, match="callable or None"):
+            register_platform_factory(
+                Platform.LOCAL, lambda c: None, requirements_check="not_callable"
+            )
 
 
 # ── TestPluginDiscovery ────────────────────────────────────────────────────
