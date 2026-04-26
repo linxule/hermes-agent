@@ -1056,6 +1056,24 @@ class KimiAdapter(BasePlatformAdapter):
         # keyed by session_key. Used for TTL eviction and drop-log metadata.
         self._pending_enqueued_at: Dict[str, float] = {}
 
+        # ── Lift 3b: output_mode flag ─────────────────────────────────────
+        # ``passthrough`` (default): agent prose + tool output both reach
+        #   Kimi via ``send()``.
+        # ``tool_only``: ``send()`` is gated — only explicit ``send_message_tool``
+        #   calls (which bypass ``adapter.send()`` and use the standalone
+        #   ``send_kimi_message`` function) produce visible Kimi messages.
+        #   Agent intermediate prose stays in Hermes logs only.
+        # Solving the bridge's ``HIDE_TOOL_CALLS=1``-hangs-Hermes problem at
+        # the source: adapter's in-process coupling differs from bridge stdio.
+        _raw_mode = config.extra.get("output_mode", "passthrough")
+        if _raw_mode not in ("passthrough", "tool_only"):
+            logger.warning(
+                "Kimi: invalid output_mode=%r — expected 'passthrough' or "
+                "'tool_only'; defaulting to 'passthrough'",
+                _raw_mode,
+            )
+            _raw_mode = "passthrough"
+        self._output_mode: str = _raw_mode
 
     async def connect(self) -> bool:
         """Open HTTP session, fetch bot identity, spawn channel loops.
@@ -1262,6 +1280,19 @@ class KimiAdapter(BasePlatformAdapter):
             mention-block wire shape is not yet confirmed via the surface
             check.
         """
+        # ── Lift 3b: output_mode gate ─────────────────────────────────────
+        # In ``tool_only`` mode the agent's prose responses are suppressed;
+        # only explicit ``send_message_tool`` calls (which route through the
+        # standalone ``send_kimi_message`` function, bypassing this method)
+        # produce visible Kimi messages.  Default is ``passthrough`` so
+        # production behavior is unchanged.
+        if self._output_mode == "tool_only":
+            logger.debug(
+                "Kimi: output_mode=tool_only — suppressing prose send to %s",
+                chat_id,
+            )
+            return SendResult(success=True)
+
         if not content:
             return SendResult(success=True)
 

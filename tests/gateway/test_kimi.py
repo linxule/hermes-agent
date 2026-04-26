@@ -3170,5 +3170,90 @@ class HakimiLift3aDropLogTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(overwrite_warnings), 0, "Eviction should not also fire a drop warning")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Lift 3b: output_mode flag
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HakimiLift3bOutputModeTests(unittest.IsolatedAsyncioTestCase):
+    """Lift 3b: output_mode: passthrough | tool_only."""
+
+    async def test_3b_1_passthrough_mode_delivers_prose(self):
+        """3b.1 — passthrough (default) — send() routes through normally."""
+        adapter = KimiAdapter(_cfg(output_mode="passthrough"))
+        self.assertEqual(adapter._output_mode, "passthrough")
+
+        # Patch the routing methods so we don't need a live WS/HTTP session.
+        adapter._send_dm = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_group = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send(
+            chat_id="dm:im:kimi:main", content="agent prose response"
+        )
+        self.assertTrue(result.success)
+        adapter._send_dm.assert_awaited_once()
+
+    async def test_3b_2_tool_only_mode_suppresses_prose(self):
+        """3b.2 — tool_only — send() is gated, nothing reaches the platform."""
+        adapter = KimiAdapter(_cfg(output_mode="tool_only"))
+        self.assertEqual(adapter._output_mode, "tool_only")
+
+        adapter._send_dm = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_group = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send(
+            chat_id="dm:im:kimi:main", content="agent prose that should be suppressed"
+        )
+        # Returns success=True (no error) but nothing was sent.
+        self.assertTrue(result.success)
+        adapter._send_dm.assert_not_awaited()
+        adapter._send_group.assert_not_awaited()
+
+    async def test_3b_3_tool_only_mode_suppresses_all_send_targets(self):
+        """3b.3 — tool_only suppresses prose to both DM and group targets."""
+        adapter = KimiAdapter(_cfg(output_mode="tool_only"))
+
+        adapter._send_dm = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_group = AsyncMock(return_value=SendResult(success=True))
+
+        # DM target.
+        result_dm = await adapter.send(
+            chat_id="dm:im:kimi:main", content="thinking out loud"
+        )
+        # Group target.
+        result_group = await adapter.send(
+            chat_id="room:abc123", content="group prose also suppressed"
+        )
+        self.assertTrue(result_dm.success)
+        self.assertTrue(result_group.success)
+        adapter._send_dm.assert_not_awaited()
+        adapter._send_group.assert_not_awaited()
+
+
+class HakimiLift3bOutputModeInitTests(unittest.TestCase):
+    """Init-level validation for output_mode."""
+
+    def test_output_mode_default_is_passthrough(self):
+        adapter = KimiAdapter(_cfg())
+        self.assertEqual(adapter._output_mode, "passthrough")
+
+    def test_output_mode_tool_only_accepted(self):
+        adapter = KimiAdapter(_cfg(output_mode="tool_only"))
+        self.assertEqual(adapter._output_mode, "tool_only")
+
+    def test_output_mode_invalid_defaults_with_warning(self):
+        records, teardown = _capture_kimi_log_records(level=logging.WARNING)
+        try:
+            adapter = KimiAdapter(_cfg(output_mode="robot_only"))
+        finally:
+            teardown()
+        self.assertEqual(adapter._output_mode, "passthrough")
+        warnings = [
+            r for r in records
+            if r.levelno == logging.WARNING and "output_mode" in r.getMessage()
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("robot_only", warnings[0].getMessage())
+
 if __name__ == "__main__":
     unittest.main()
