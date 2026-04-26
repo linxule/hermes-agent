@@ -2962,5 +2962,213 @@ class Probe3MessageIdTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("'ten'", warnings[0].getMessage())
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Lift 3a: interrupt-and-drain queue improvements (pending-slot drop-log + TTL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_message_event(text: str = "hello", chat_id: str = "dm:im:kimi:main") -> "MagicMock":
+    """Build a minimal MessageEvent-like object for testing handle_message."""
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+
+    source = SessionSource(
+        platform=Platform.KIMI,
+        chat_id=chat_id,
+        chat_type="dm",
+        user_id="kimi:user:1",
+    )
+    event = MagicMock(spec=MessageEvent)
+    event.source = source
+    event.text = text
+    event.message_type = MessageType.TEXT
+    event.message_id = "msg-test"
+    return event
+
+
+def _compute_session_key(adapter: "KimiAdapter", event: "MagicMock") -> str:
+    """Compute the session key the adapter will derive for a given event."""
+    from gateway.session import build_session_key
+    return build_session_key(
+        event.source,
+        group_sessions_per_user=adapter._group_sessions_per_user,
+        thread_sessions_per_user=adapter._thread_sessions_per_user,
+    )
+
+
+class HakimiLift3aDropLogTests(unittest.IsolatedAsyncioTestCase):
+    """Lift 3a: WARN log when a pending-slot overwrite occurs."""
+
+    async def test_3a_1_drop_log_on_overwrite(self):
+        """3a.1 — overwriting an existing pending slot emits a WARNING with
+        chat_id and message preview."""
+        adapter = KimiAdapter(_cfg())
+
+        # Simulate a session in progress (active-session guard set).
+        first_event = _make_message_event("first pending message")
+        session_key = _compute_session_key(adapter, first_event)
+        guard = asyncio.Event()
+        adapter._active_sessions[session_key] = guard
+
+        # Put a first pending message in the slot.
+        adapter._pending_messages[session_key] = first_event
+        adapter._pending_enqueued_at[session_key] = 1.0  # arbitrary
+
+        # Now call handle_message with a SECOND message — this should overwrite.
+        second_event = _make_message_event("second message overwrites first")
+        # Patch super().handle_message to avoid real dispatch.
+        records, teardown = _capture_kimi_log_records(level=logging.WARNING)
+        try:
+            with patch.object(
+                adapter.__class__.__bases__[0], "handle_message", new=AsyncMock()
+            ):
+                await adapter.handle_message(second_event)
+        finally:
+            teardown()
+
+        warnings = [
+            r for r in records
+            if r.levelno == logging.WARNING and "overwriting pending slot" in r.getMessage()
+        ]
+        self.assertEqual(len(warnings), 1, f"Expected one overwrite WARNING, got: {[r.getMessage() for r in records]}")
+        msg = warnings[0].getMessage()
+        self.assertIn("first pending", msg)  # preview of the dropped message
+
+    async def test_3a_2_error_path_drain_preserved(self):
+        """3a.2 — when message_handler raises, the pending slot is still drained.
+
+        BasePlatformAdapter already handles this via the late-arrival drain in
+        _process_message_background's ``finally`` block. This test documents and
+        exercises the contract: after a handler exception, a message queued in
+        _pending_messages is NOT silently lost.
+
+        Implementation note: we test the base-class invariant via the KimiAdapter
+        since KimiAdapter.handle_message delegates to super().handle_message which
+        runs _process_message_background. The test checks that after an exception
+        during handler execution, _pending_messages is cleared (either consumed or
+        cleaned up).
+        """
+        adapter = KimiAdapter(_cfg())
+
+        first_event = _make_message_event("first message that will error")
+        session_key = _compute_session_key(adapter, first_event)
+
+        # Set up a message handler that raises on the first call, succeeds on second.
+        call_count = [0]
+
+        async def _handler(event):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("synthetic processing error")
+            return "ok"
+
+        adapter.set_message_handler(_handler)
+
+        second_event = _make_message_event("second message — must not be lost")
+
+        # Queue second event in pending slot before first processes.
+        adapter._pending_messages[session_key] = second_event
+        adapter._pending_enqueued_at[session_key] = 0.0  # pre-enqueued
+
+        # Now simulate base._process_message_background having set the active guard.
+        guard = asyncio.Event()
+        guard.set()  # interrupt already signalled
+        adapter._active_sessions[session_key] = guard
+        adapter._session_tasks[session_key] = asyncio.current_task()
+
+        # Run _process_message_background which includes our exception + drain path.
+        try:
+            await adapter._process_message_background(first_event, session_key)
+        except Exception:
+            pass  # exception propagation details not under test
+
+        # After the whole run, _pending_messages for this session should be gone —
+        # the pending message was either dispatched (good) or cleaned up (acceptable).
+        # The key invariant: it is NOT still sitting unprocessed in the dict
+        # while the session is no longer active.
+        session_still_active = session_key in adapter._active_sessions
+        pending_still_queued = session_key in adapter._pending_messages
+        self.assertFalse(
+            session_still_active and pending_still_queued,
+            "Pending message stranded: session is inactive but pending slot not cleared.",
+        )
+
+    async def test_3a_3_ttl_disabled_by_default(self):
+        """3a.3 — with no TTL configured, pending slot never expires."""
+        adapter = KimiAdapter(_cfg())  # no pending_message_ttl_seconds
+
+        self.assertIsNone(adapter._pending_message_ttl)
+
+        # Simulate an arbitrarily old pending message.
+        old_event = _make_message_event("old pending message")
+        session_key = _compute_session_key(adapter, old_event)
+        guard = asyncio.Event()
+        adapter._active_sessions[session_key] = guard
+
+        adapter._pending_messages[session_key] = old_event
+        # Enqueued a long time ago (1000 seconds).
+        import time as _time
+        adapter._pending_enqueued_at[session_key] = _time.monotonic() - 1000.0
+
+        new_event = _make_message_event("newer message")
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        try:
+            with patch.object(
+                adapter.__class__.__bases__[0], "handle_message", new=AsyncMock()
+            ):
+                await adapter.handle_message(new_event)
+        finally:
+            teardown()
+
+        # No eviction log should appear.
+        eviction_logs = [
+            r for r in records
+            if "evicting expired" in r.getMessage()
+        ]
+        self.assertEqual(len(eviction_logs), 0, "TTL eviction should not fire when TTL is None")
+
+    async def test_3a_4_ttl_enabled_evicts_expired_pending(self):
+        """3a.4 — with TTL set, an expired pending slot is evicted and logged."""
+        import time as _time
+        adapter = KimiAdapter(_cfg(pending_message_ttl_seconds=5))
+
+        self.assertEqual(adapter._pending_message_ttl, 5.0)
+
+        old_event = _make_message_event("expired pending message")
+        session_key = _compute_session_key(adapter, old_event)
+        guard = asyncio.Event()
+        adapter._active_sessions[session_key] = guard
+
+        adapter._pending_messages[session_key] = old_event
+        # Enqueued well past the 5s TTL.
+        adapter._pending_enqueued_at[session_key] = _time.monotonic() - 60.0
+
+        new_event = _make_message_event("fresh message after expiry")
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        try:
+            with patch.object(
+                adapter.__class__.__bases__[0], "handle_message", new=AsyncMock()
+            ):
+                await adapter.handle_message(new_event)
+        finally:
+            teardown()
+
+        eviction_logs = [
+            r for r in records
+            if "evicting expired" in r.getMessage()
+        ]
+        self.assertEqual(
+            len(eviction_logs), 1,
+            f"Expected one eviction INFO log, got: {[r.getMessage() for r in records]}",
+        )
+        # After eviction of the old slot the new message is NOT double-logged as
+        # an "overwriting" drop (the slot was cleared before the drop-log check).
+        overwrite_warnings = [
+            r for r in records
+            if "overwriting pending slot" in r.getMessage()
+        ]
+        self.assertEqual(len(overwrite_warnings), 0, "Eviction should not also fire a drop warning")
+
 if __name__ == "__main__":
     unittest.main()

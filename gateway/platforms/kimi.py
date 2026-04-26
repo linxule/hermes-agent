@@ -1040,6 +1040,23 @@ class KimiAdapter(BasePlatformAdapter):
             self._probe_msg_id_sample_rate = 1
         self._probe_msg_id_room_counts: Dict[str, int] = {}
 
+        # ── Lift 3a: interrupt-and-drain queue improvements ───────────────
+        # Pending-slot TTL (seconds). ``None`` = never expire (default,
+        # matches Bloom's ``session_reset.mode: none`` — sessions are held
+        # indefinitely). When set, a queued pending message older than this
+        # many seconds is silently evicted and not dispatched to the agent,
+        # preventing stale follow-ups from re-entering the conversation after
+        # a long tool-call turn. Hakimi hard-codes 5 minutes; we make it
+        # configurable so operators tune to their session-lifetime preference.
+        _raw_ttl = config.extra.get("pending_message_ttl_seconds")
+        self._pending_message_ttl: Optional[float] = (
+            float(_raw_ttl) if _raw_ttl is not None else None
+        )
+        # Timestamps of when each pending message was *first* enqueued,
+        # keyed by session_key. Used for TTL eviction and drop-log metadata.
+        self._pending_enqueued_at: Dict[str, float] = {}
+
+
     async def connect(self) -> bool:
         """Open HTTP session, fetch bot identity, spawn channel loops.
 
@@ -1135,6 +1152,91 @@ class KimiAdapter(BasePlatformAdapter):
             self._http_session = None
 
     # ──────────────────────────────────────────────────────────────────────
+    # ── Lift 3a: handle_message override ─────────────────────────────────
+
+    async def handle_message(self, event: MessageEvent) -> None:  # type: ignore[override]
+        """Augment base dispatch with pending-slot drop-logging and TTL eviction.
+
+        Hakimi's ``processMessage`` pattern (``chatRouter.ts:395-433``) uses a
+        single-slot pending buffer and silently drops messages when a second
+        follow-up arrives before the first processes. ``BasePlatformAdapter``
+        already implements the slot + interrupt-and-drain correctly (including
+        the error-path drain via ``finally``). This override adds two
+        improvements over hakimi:
+
+        1. **WARN on pending-slot overwrite** — when a new message overwrites
+           an existing pending slot (hakimi silently drops). Logs chat_id and
+           a 80-char redacted preview of the dropped message text.
+        2. **Configurable TTL** — if ``pending_message_ttl_seconds`` is set,
+           evict an expired pending message (too stale to be useful) before
+           queuing the new one. Hakimi hard-codes 5 minutes; default here is
+           ``None`` (no expiry) to match Bloom's indefinite session config.
+
+        The error-path drain fix (drain runs in ``finally``, not just in
+        ``try``) is already correct in ``BasePlatformAdapter`` via the
+        late-arrival drain in ``_process_message_background``.
+        """
+        from gateway.session import build_session_key as _bsk
+
+        session_key = _bsk(
+            event.source,
+            group_sessions_per_user=self._group_sessions_per_user,
+            thread_sessions_per_user=self._thread_sessions_per_user,
+        )
+
+        # Only intervene when there is already an active session — this is
+        # the exact condition under which the base class would overwrite the
+        # pending slot.
+        if session_key in self._active_sessions:
+            now = time.monotonic()
+
+            # ── TTL eviction ────────────────────────────────────────────────
+            existing = self._pending_messages.get(session_key)
+            if existing is not None and self._pending_message_ttl is not None:
+                enqueued_at = self._pending_enqueued_at.get(session_key)
+                if enqueued_at is not None:
+                    age = now - enqueued_at
+                    if age > self._pending_message_ttl:
+                        logger.info(
+                            "Kimi [%s]: evicting expired pending message "
+                            "(age=%.1fs > ttl=%.1fs) — slot freed for new message",
+                            session_key,
+                            age,
+                            self._pending_message_ttl,
+                        )
+                        self._pending_messages.pop(session_key, None)
+                        self._pending_enqueued_at.pop(session_key, None)
+                        existing = None
+
+            # ── Drop-log when overwriting a non-expired slot ────────────────
+            existing = self._pending_messages.get(session_key)
+            if existing is not None:
+                dropped_text = getattr(existing, "text", "") or ""
+                preview = dropped_text[:80].replace("\n", " ")
+                if len(dropped_text) > 80:
+                    preview += "..."
+                logger.warning(
+                    "Kimi [%s]: overwriting pending slot — dropping message "
+                    "(preview: %r). Latest message will be queued instead "
+                    "(last-wins semantics).",
+                    session_key,
+                    preview,
+                )
+                self._pending_enqueued_at.pop(session_key, None)
+
+            # Record enqueue timestamp for the new pending message.
+            # Set BEFORE calling super() so the slot timestamp is consistent
+            # with what super() puts in _pending_messages.
+            self._pending_enqueued_at[session_key] = now
+
+        await super().handle_message(event)
+
+        # Clean up timestamp when the session finishes (slot consumed or
+        # not needed). Guard: only drop if the slot itself is gone, so a
+        # rapidly-arriving follow-up doesn't race-clear a fresh timestamp.
+        if session_key not in self._pending_messages:
+            self._pending_enqueued_at.pop(session_key, None)
+
     # Public send / platform-surface overrides
     # ──────────────────────────────────────────────────────────────────────
 
