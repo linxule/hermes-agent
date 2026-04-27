@@ -3172,6 +3172,103 @@ class HakimiLift3aDropLogTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Issue #33: _pending_enqueued_at teardown + cancellation cleanup
+#
+# Three layered guarantees: (1) cancel_background_tasks override clears our
+# parallel TTL state to mirror base behaviour; (2) disconnect() also clears as
+# defense-in-depth for the direct-disconnect call sites that bypass the drain
+# (gateway/run.py:_safe_adapter_disconnect, error-recovery in connect()); (3)
+# `handle_message`'s post-super cleanup is wrapped in `try/finally` so any
+# unexpected exception from super doesn't leak a stamped timestamp.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PendingEnqueuedAtCleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Issue #33: _pending_enqueued_at must be cleared across teardown paths."""
+
+    async def test_cancel_background_tasks_clears_pending_enqueued_at(self):
+        """cancel_background_tasks override must mirror the base's clear()
+        behaviour for our parallel TTL state."""
+        adapter = KimiAdapter(_cfg())
+        adapter._pending_enqueued_at["dm:test:abc"] = 1.0
+        adapter._pending_enqueued_at["room:xyz"] = 2.0
+        # super().cancel_background_tasks() walks _background_tasks (empty
+        # on a fresh adapter) and clears the base's parallel dicts; our
+        # override should clear _pending_enqueued_at on top of that.
+        await adapter.cancel_background_tasks()
+        self.assertEqual(
+            adapter._pending_enqueued_at, {},
+            "cancel_background_tasks should clear _pending_enqueued_at"
+        )
+
+    async def test_disconnect_clears_pending_enqueued_at(self):
+        """disconnect() must clear _pending_enqueued_at as defense-in-depth
+        for direct-disconnect call sites that bypass cancel_background_tasks."""
+        adapter = KimiAdapter(_cfg())
+        adapter._pending_enqueued_at["dm:test:abc"] = 1.0
+        adapter._pending_enqueued_at["room:xyz"] = 2.0
+        # Patch out network/lock teardown — the test only cares about the
+        # parallel-state clear; the rest is unrelated infrastructure.
+        with patch.object(adapter, "_cleanup_http", new=AsyncMock()), \
+             patch.object(adapter, "_release_platform_lock"):
+            await adapter.disconnect()
+        self.assertEqual(
+            adapter._pending_enqueued_at, {},
+            "disconnect should clear _pending_enqueued_at"
+        )
+
+    async def test_connect_clears_pending_enqueued_at(self):
+        """connect() must clear stale TTL state as a belt-and-braces sweep
+        before establishing a new session — protects against any path that
+        reuses the adapter without going through disconnect first."""
+        adapter = KimiAdapter(_cfg())
+        adapter._pending_enqueued_at["dm:stale:xyz"] = 99.0  # leftover from prior session
+
+        # connect() reaches the clear() before any network IO. Make connect
+        # short-circuit at GetMe so we don't have to mock the whole WS stack.
+        with patch.object(adapter, "_acquire_platform_lock", return_value=True), \
+             patch.object(adapter, "_rpc_unary", new=AsyncMock(side_effect=KimiAuthError("test"))), \
+             patch.object(adapter, "_cleanup_http", new=AsyncMock()), \
+             patch.object(adapter, "_release_platform_lock"):
+            # Returns False because GetMe raises; the clear() ran before that.
+            result = await adapter.connect()
+            self.assertFalse(result, "connect() should fail when GetMe raises")
+        self.assertEqual(
+            adapter._pending_enqueued_at, {},
+            "connect should clear stale TTL state at session start"
+        )
+
+    async def test_handle_message_cleanup_runs_on_cancellation(self):
+        """try/finally ensures the post-super cleanup runs on CancelledError,
+        so a per-task cancellation outside of full adapter teardown doesn't
+        leak a stamped timestamp into the next handler invocation."""
+        adapter = KimiAdapter(_cfg())
+        event = _make_message_event("test message")
+        session_key = _compute_session_key(adapter, event)
+
+        # Simulate an active session so the override stamps _pending_enqueued_at.
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        # Patch super().handle_message to raise CancelledError mid-await, AFTER
+        # the override stamped its timestamp. _pending_messages is left empty
+        # (the mock does no enqueueing), so the cleanup guard's "if session_key
+        # not in _pending_messages" branch should fire.
+        with patch.object(
+            adapter.__class__.__bases__[0],
+            "handle_message",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await adapter.handle_message(event)
+
+        self.assertNotIn(
+            session_key,
+            adapter._pending_enqueued_at,
+            "try/finally should pop the timestamp on CancelledError when the "
+            "pending slot was never populated",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Lift 3b: output_mode flag
 # ═══════════════════════════════════════════════════════════════════════════════
 
