@@ -451,6 +451,16 @@ PLATFORM_HINTS = {
         "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
         "— when a sticker is the right response, use yb_send_sticker."
     ),
+    "kimi": (
+        "You are on Kimi (kimi.com / Moonshot AI), communicating with your user through Kimi's "
+        "web or mobile chat. Kimi renders standard Markdown — bold, italic, code blocks, lists, "
+        "and links all work. Two channels share one bot identity: 1:1 DMs (streamed responses, "
+        "ACP-style progressive rendering) and group rooms (full replies posted as single messages, "
+        "optionally inside threads). Keep responses natural and conversational — Kimi's UI shows "
+        "progressive output in DMs, so medium-length messages feel fluid. For group rooms, prefer "
+        "concise replies and @-mention specific users with im_mention{short_id} syntax when you "
+        "want to target someone directly."
+    ),
 }
 
 # ---------------------------------------------------------------------------

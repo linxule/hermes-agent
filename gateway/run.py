@@ -3226,10 +3226,12 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.KIMI: "KIMI_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+            Platform.KIMI: "KIMI_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -3249,6 +3251,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.KIMI: "KIMI_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -3299,7 +3302,10 @@ class GatewayRunner:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
             }
-            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+            source_group_ids = {source.chat_id}
+            if source.platform == Platform.KIMI and source.chat_id.startswith("room:"):
+                source_group_ids.add(source.chat_id[len("room:"):])
+            if "*" in allowed_group_ids or (allowed_group_ids & source_group_ids):
                 return True
 
         # Check if user is in any allowlist
@@ -3380,6 +3386,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.KIMI:     "KIMI_ALLOWED_USERS",
             }
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
@@ -4879,10 +4886,15 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+        # Suppress once /sethome has persisted a channel — that handler writes
+        # both KIMI_HOME_CHANNEL-style env keys AND config.yaml. We check
+        # config first (authoritative source) and fall back to env for the
+        # first-run case where the session predates any /sethome.
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-            if not os.getenv(env_key):
+            home_channel = self.config.get_home_channel(source.platform)
+            if not home_channel and not os.getenv(env_key):
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     # Slack dispatches all Hermes commands through a single
