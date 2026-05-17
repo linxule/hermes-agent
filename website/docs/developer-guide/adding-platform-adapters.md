@@ -171,6 +171,46 @@ gateway:
 
 Or via environment variables (which the adapter reads in `__init__`).
 
+:::caution Configuration values are passed raw
+Hermes does **not** perform `${VAR}` substitution on YAML config values. If your
+plugin's `config.yaml` block uses a value like `token: ${MY_TOKEN}`, the literal
+string `"${MY_TOKEN}"` arrives at your adapter — not the resolved env value.
+
+Built-in platforms like Telegram, Discord, and IRC appear to support
+`${BOT_TOKEN}` patterns only because `_apply_env_overrides()` in
+`gateway/config.py` has hardcoded entries (e.g. `TELEGRAM_BOT_TOKEN`) that
+overwrite `PlatformConfig.token` after the YAML is parsed. External plugins
+registered via `ctx.register_platform()` get no such treatment.
+
+**Canonical: `apply_yaml_config_fn`.** Register a callback as a `PlatformEntry`
+kwarg that translates `config.yaml` keys into env vars at load time; your
+adapter then reads via `os.getenv()` in `__init__`, exactly like the
+`MyPlatformAdapter` example above. This is the right answer for any plugin
+whose users put non-secret YAML config (allowed channels, feature flags, etc.)
+alongside their token — one consistent place to validate, normalise, and
+export to the env. See [YAML→env Config Bridge](#yamlenv-config-bridge) for
+the worked example.
+
+**Fallback for env-only adapters: defensive `${VAR}` resolver in the adapter.**
+If your plugin doesn't otherwise need a YAML translator, a small helper that
+detects `"${VAR}"` literals and resolves them via `os.getenv()` keeps the
+docker-compose convention working without registering a hook. Idempotent —
+already-resolved values won't match the `${...}` shape, so the helper is a
+no-op against any registry-level resolution that may run before it. Reference
+implementation:
+[`_resolve_env_template`](https://github.com/linxule/hermes-kimi-plugin/blob/main/kimi/kimi_adapter.py)
+in `linxule/hermes-kimi-plugin`. Note that this pattern diverges from the
+in-tree `_expand_env_vars` convention in `hermes_cli/config.py` (which keeps
+unresolved `${VAR}` verbatim) by resolving to `""` and logging a warning
+instead — defensive adapters typically want loud-fail-on-empty for auth-critical
+fields rather than silently sending a literal `${VAR}` to a remote API. Adapt
+to your platform's auth model.
+
+**Short version:** if you have YAML config beyond a single token, register
+`apply_yaml_config_fn`. If you're env-only and want to support `${VAR}` in
+YAML anyway, drop a small resolver into your adapter `__init__`.
+:::
+
 ### What the Plugin System Handles Automatically
 
 When you call `ctx.register_platform()`, the following integration points are handled for you — no core code changes needed:
