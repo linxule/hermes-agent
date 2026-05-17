@@ -202,6 +202,332 @@ class TestPlatformRegistry:
         assert reg.get("dup").label == "Dup v2"
 
 
+# ── ${VAR} env template resolution ────────────────────────────────────────
+
+
+class TestEnvTemplateResolution:
+    """Test ``${VAR}`` resolution applied by ``create_adapter`` to ``PlatformConfig``.
+
+    External plugins receive ``PlatformConfig`` straight from the YAML loader
+    (no substitution).  ``create_adapter`` resolves ``${VAR}`` literals in
+    ``token`` / ``api_key`` before calling the factory, giving plugin adapters
+    parity with built-in platforms whose tokens are resolved by
+    ``_apply_env_overrides()`` in ``gateway/config.py``.
+    """
+
+    def test_helper_resolves_template_with_env_set(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        with patch.dict(os.environ, {"MY_TEMPLATE_VAR": "secret-value"}, clear=False):
+            assert _resolve_env_template("${MY_TEMPLATE_VAR}") == "secret-value"
+
+    def test_helper_resolves_template_with_env_unset(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        # Ensure the var is genuinely absent for this case.
+        os.environ.pop("DEFINITELY_UNSET_VAR_4f7c2", None)
+        assert _resolve_env_template("${DEFINITELY_UNSET_VAR_4f7c2}") == ""
+
+    def test_helper_resolves_template_with_env_empty_string(self):
+        """Env var EXISTS but is an empty string (e.g. ``MY_VAR=`` in .env).
+
+        ``os.getenv`` returns ``""`` for both unset and empty-string cases,
+        so the helper's result is identical — but the warning emitted by
+        :func:`apply_env_template_substitutions` should describe BOTH cases
+        ("is unset or empty"), and operators should still see the loud
+        warning regardless of which case they hit.
+        """
+        from gateway.platform_registry import _resolve_env_template
+
+        with patch.dict(os.environ, {"EMPTY_VAR_TEST_8a2d": ""}, clear=False):
+            assert _resolve_env_template("${EMPTY_VAR_TEST_8a2d}") == ""
+
+    def test_helper_plain_string_passthrough(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        assert _resolve_env_template("plain-literal-token") == "plain-literal-token"
+
+    def test_helper_none_passthrough(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        assert _resolve_env_template(None) is None
+
+    def test_helper_empty_string_passthrough(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        assert _resolve_env_template("") == ""
+
+    def test_helper_partial_template_unchanged(self):
+        """Only whole-field templates are resolved.  Prefixed/suffixed values pass through."""
+        from gateway.platform_registry import _resolve_env_template
+
+        with patch.dict(os.environ, {"X": "abc"}, clear=False):
+            # Partial template — kept as-is to avoid surprising substring substitution.
+            assert _resolve_env_template("prefix-${X}") == "prefix-${X}"
+            assert _resolve_env_template("${X}-suffix") == "${X}-suffix"
+
+    def test_helper_whitespace_tolerance(self):
+        """Surrounding whitespace inside a template field still resolves."""
+        from gateway.platform_registry import _resolve_env_template
+
+        with patch.dict(os.environ, {"WHITESPACE_VAR": "ok"}, clear=False):
+            assert _resolve_env_template("  ${WHITESPACE_VAR}  ") == "ok"
+
+    def test_helper_non_string_passthrough(self):
+        from gateway.platform_registry import _resolve_env_template
+
+        # Non-strings (defensive: PlatformConfig.token is Optional[str], but
+        # any future schema change shouldn't crash here).
+        assert _resolve_env_template(123) == 123
+        sentinel = object()
+        assert _resolve_env_template(sentinel) is sentinel
+
+    def test_helper_idempotent(self):
+        """Already-resolved values don't match the template shape, so a second pass is a no-op."""
+        from gateway.platform_registry import _resolve_env_template
+
+        with patch.dict(os.environ, {"IDEMP_VAR": "resolved"}, clear=False):
+            once = _resolve_env_template("${IDEMP_VAR}")
+            twice = _resolve_env_template(once)
+            assert once == "resolved"
+            assert twice == "resolved"
+
+    def test_create_adapter_resolves_token_template(self):
+        """End-to-end: a PlatformConfig with a ``${VAR}`` token reaches the factory resolved."""
+        reg = PlatformRegistry()
+        captured = {}
+
+        def factory(cfg):
+            captured["token"] = cfg.token
+            captured["api_key"] = cfg.api_key
+            return MagicMock()
+
+        reg.register(PlatformEntry(
+            name="testresolve",
+            label="TestResolve",
+            adapter_factory=factory,
+            check_fn=lambda: True,
+            validate_config=None,
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(
+            enabled=True,
+            token="${E2E_TOKEN_VAR}",
+            api_key="${E2E_API_KEY_VAR}",
+        )
+        with patch.dict(
+            os.environ,
+            {"E2E_TOKEN_VAR": "tok-123", "E2E_API_KEY_VAR": "key-456"},
+            clear=False,
+        ):
+            adapter = reg.create_adapter("testresolve", cfg)
+
+        assert adapter is not None
+        assert captured["token"] == "tok-123"
+        assert captured["api_key"] == "key-456"
+        # The PlatformConfig itself is mutated in place (matches the
+        # _apply_env_overrides() pattern for built-in platforms).
+        assert cfg.token == "tok-123"
+        assert cfg.api_key == "key-456"
+
+    def test_create_adapter_passes_through_plain_token(self):
+        """End-to-end: a plain literal token is unchanged by the registry."""
+        reg = PlatformRegistry()
+        captured = {}
+
+        def factory(cfg):
+            captured["token"] = cfg.token
+            return MagicMock()
+
+        reg.register(PlatformEntry(
+            name="testplain",
+            label="TestPlain",
+            adapter_factory=factory,
+            check_fn=lambda: True,
+            validate_config=None,
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(enabled=True, token="literal-bot-token-xyz")
+        reg.create_adapter("testplain", cfg)
+        assert captured["token"] == "literal-bot-token-xyz"
+
+    def test_validate_config_sees_resolved_token(self):
+        """Substitution runs BEFORE validate_config — a plugin that checks
+        bool(config.token) must see the resolved env value, not the literal.
+
+        Regression guard against the ordering bug where validate would pass
+        on a truthy "${UNSET_VAR}" literal and then the factory would receive
+        an empty token.
+        """
+        reg = PlatformRegistry()
+        seen_during_validate = {}
+
+        def validate(cfg):
+            seen_during_validate["token"] = cfg.token
+            return bool(cfg.token)
+
+        reg.register(PlatformEntry(
+            name="testvalorder",
+            label="TestValOrder",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            validate_config=validate,
+            source="plugin",
+        ))
+
+        # Case 1: env set → validate sees resolved value → passes
+        cfg_ok = PlatformConfig(enabled=True, token="${VAL_ORDER_VAR}")
+        with patch.dict(os.environ, {"VAL_ORDER_VAR": "real-token"}, clear=False):
+            adapter = reg.create_adapter("testvalorder", cfg_ok)
+        assert adapter is not None
+        assert seen_during_validate["token"] == "real-token"
+
+        # Case 2: env unset → validate sees "" → fails (caught loudly)
+        seen_during_validate.clear()
+        cfg_unset = PlatformConfig(enabled=True, token="${VAL_ORDER_UNSET}")
+        os.environ.pop("VAL_ORDER_UNSET", None)
+        adapter = reg.create_adapter("testvalorder", cfg_unset)
+        assert adapter is None
+        assert seen_during_validate["token"] == ""
+
+    def test_create_adapter_resolves_extra_dict(self):
+        """End-to-end: ``${VAR}`` literals inside ``config.extra`` are also resolved.
+
+        The canonical plugin example (`adding-platform-adapters.md`) puts
+        secondary settings in ``extra:``, so plugin authors who write
+        ``extra: {token: ${MY_TOKEN}}`` should get parity with
+        ``token: ${MY_TOKEN}``.
+        """
+        reg = PlatformRegistry()
+        captured = {}
+
+        def factory(cfg):
+            captured["extra"] = dict(cfg.extra)
+            return MagicMock()
+
+        reg.register(PlatformEntry(
+            name="testextra",
+            label="TestExtra",
+            adapter_factory=factory,
+            check_fn=lambda: True,
+            validate_config=None,
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "${EXTRA_BOT_TOKEN}",
+                "channel": "${EXTRA_CHANNEL}",
+                "non_template": "plain-channel-name",
+                "numeric_keep": 42,
+            },
+        )
+        with patch.dict(
+            os.environ,
+            {"EXTRA_BOT_TOKEN": "extra-tok-9", "EXTRA_CHANNEL": "#general"},
+            clear=False,
+        ):
+            reg.create_adapter("testextra", cfg)
+
+        assert captured["extra"]["bot_token"] == "extra-tok-9"
+        assert captured["extra"]["channel"] == "#general"
+        assert captured["extra"]["non_template"] == "plain-channel-name"
+        assert captured["extra"]["numeric_keep"] == 42  # non-strings untouched
+
+    def test_create_adapter_logs_warning_on_empty_resolution(self, caplog):
+        """Empty env-var resolution emits WARNING so silent failures stay loud."""
+        import logging as _logging
+
+        reg = PlatformRegistry()
+        reg.register(PlatformEntry(
+            name="testwarn",
+            label="TestWarn",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            validate_config=None,
+            source="plugin",
+        ))
+
+        os.environ.pop("WARN_UNSET_VAR", None)
+        cfg = PlatformConfig(enabled=True, token="${WARN_UNSET_VAR}")
+        with caplog.at_level(_logging.WARNING, logger="gateway.platform_registry"):
+            reg.create_adapter("testwarn", cfg)
+        warnings = [r for r in caplog.records if "WARN_UNSET_VAR" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "is unset" in warnings[0].getMessage()
+        assert warnings[0].levelno == _logging.WARNING
+
+    def test_create_adapter_mutation_on_validation_failure(self):
+        """If validate_config returns False, the config IS still mutated by
+        substitution that ran before validation.
+
+        Contract test: substitution is unconditional once check_fn passes.
+        Callers that reuse a PlatformConfig fixture after validation failure
+        should be aware the dataclass fields were mutated in place.
+        """
+        reg = PlatformRegistry()
+        reg.register(PlatformEntry(
+            name="testmutval",
+            label="TestMutVal",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            validate_config=lambda cfg: False,  # always rejects
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(enabled=True, token="${MUT_VAL_VAR}")
+        with patch.dict(os.environ, {"MUT_VAL_VAR": "before-rejection"}, clear=False):
+            result = reg.create_adapter("testmutval", cfg)
+        assert result is None
+        assert cfg.token == "before-rejection"  # mutated even though validation failed
+
+    def test_create_adapter_mutation_on_factory_failure(self):
+        """If the factory raises, the config is still mutated (substitution
+        already ran).  Documents the asymmetry with `check_fn`/`validate_config`
+        failure paths."""
+        reg = PlatformRegistry()
+        reg.register(PlatformEntry(
+            name="testmutfact",
+            label="TestMutFact",
+            adapter_factory=lambda cfg: (_ for _ in ()).throw(RuntimeError("boom")),
+            check_fn=lambda: True,
+            validate_config=None,
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(enabled=True, token="${MUT_FACT_VAR}")
+        with patch.dict(os.environ, {"MUT_FACT_VAR": "resolved-then-boom"}, clear=False):
+            result = reg.create_adapter("testmutfact", cfg)
+        assert result is None
+        assert cfg.token == "resolved-then-boom"  # mutated before factory raised
+
+    def test_create_adapter_no_mutation_when_check_fails(self):
+        """If check_fn returns False, substitution doesn't run at all.
+
+        Documents the boundary: check_fn is the cheapest gate and runs before
+        any mutation, so a misconfigured plugin doesn't accidentally mutate
+        user configs as a side effect of probing.
+        """
+        reg = PlatformRegistry()
+        reg.register(PlatformEntry(
+            name="testnomut",
+            label="TestNoMut",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: False,  # short-circuit early
+            validate_config=None,
+            source="plugin",
+        ))
+
+        cfg = PlatformConfig(enabled=True, token="${NOMUT_VAR}")
+        with patch.dict(os.environ, {"NOMUT_VAR": "should-not-resolve"}, clear=False):
+            result = reg.create_adapter("testnomut", cfg)
+        assert result is None
+        assert cfg.token == "${NOMUT_VAR}"  # untouched
+
+
 # ── GatewayConfig integration ────────────────────────────────────────────
 
 
@@ -284,6 +610,142 @@ class TestGatewayConfigPluginPlatform:
             assert "badconfig" not in connected_values
         finally:
             _reg.unregister("badconfig")
+
+    def test_get_connected_resolves_token_template_before_validator(self):
+        """Regression guard for the lifecycle split (Codex H4): a plugin
+        validator that checks ``bool(config.token)`` would otherwise accept
+        the truthy literal ``"${UNSET_VAR}"`` and report the platform as
+        connected, while a later ``create_adapter`` call would resolve it
+        to ``""`` and refuse to construct.  After this fix, the validator
+        sees the resolved value and rejects the misconfigured platform.
+        """
+        from gateway.platform_registry import platform_registry as _reg
+
+        seen_during_validate = {}
+
+        def validate(cfg):
+            seen_during_validate["token"] = cfg.token
+            return bool(cfg.token)
+
+        test_entry = PlatformEntry(
+            name="tplifecycle",
+            label="TPLifecycle",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            validate_config=validate,
+            source="plugin",
+        )
+        _reg.register(test_entry)
+        try:
+            # Case A: env unset — validator must see "" and reject
+            os.environ.pop("LIFECYCLE_TOKEN_VAR", None)
+            data_unset = {
+                "platforms": {
+                    "tplifecycle": {"enabled": True, "token": "${LIFECYCLE_TOKEN_VAR}"},
+                }
+            }
+            cfg_unset = GatewayConfig.from_dict(data_unset)
+            connected = cfg_unset.get_connected_platforms()
+            assert "tplifecycle" not in {p.value for p in connected}, (
+                "Plugin with ${UNSET_VAR} token should NOT be reported as "
+                "connected: validator must see the empty resolved value, "
+                "not the truthy literal ${LIFECYCLE_TOKEN_VAR}."
+            )
+            assert seen_during_validate["token"] == ""
+
+            # Case B: env set — substitution resolves to a truthy value and
+            # the platform IS reported as connected (passes the generic
+            # token check at the top of ``_is_platform_connected``).
+            with patch.dict(
+                os.environ,
+                {"LIFECYCLE_TOKEN_VAR": "real-token"},
+                clear=False,
+            ):
+                data_ok = {
+                    "platforms": {
+                        "tplifecycle": {
+                            "enabled": True,
+                            "token": "${LIFECYCLE_TOKEN_VAR}",
+                        },
+                    }
+                }
+                cfg_ok = GatewayConfig.from_dict(data_ok)
+                connected = cfg_ok.get_connected_platforms()
+            assert "tplifecycle" in {p.value for p in connected}
+            # The PlatformConfig stored on the GatewayConfig has been
+            # mutated by substitution (this is a *contract*, not an
+            # implementation detail: subsequent ``create_adapter`` calls
+            # rely on the mutated value).
+            assert cfg_ok.platforms[Platform("tplifecycle")].token == "real-token"
+        finally:
+            _reg.unregister("tplifecycle")
+
+    def test_get_connected_resolves_extra_token_before_plugin_hook(self):
+        """Plugin ``validate_config`` hooks see resolved ``${VAR}`` values
+        when invoked via ``get_connected_platforms``.
+
+        Without this fix, a plugin validator like
+        ``lambda c: bool(c.extra.get("token"))`` would accept the truthy
+        literal ``"${UNSET}"`` and report the platform as connected while
+        ``create_adapter`` would later reject the same config.
+        """
+        from gateway.platform_registry import platform_registry as _reg
+
+        seen = {}
+
+        def validate(cfg):
+            seen["token"] = cfg.extra.get("token")
+            return bool(cfg.extra.get("token"))
+
+        test_entry = PlatformEntry(
+            name="tphookresolved",
+            label="TPHookResolved",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: True,
+            validate_config=validate,
+            source="plugin",
+        )
+        _reg.register(test_entry)
+        try:
+            # Env set → resolved → validator passes
+            with patch.dict(
+                os.environ,
+                {"HOOK_RESOLVED_TOKEN": "real-tok"},
+                clear=False,
+            ):
+                data_ok = {
+                    "platforms": {
+                        "tphookresolved": {
+                            "enabled": True,
+                            "extra": {"token": "${HOOK_RESOLVED_TOKEN}"},
+                        },
+                    }
+                }
+                cfg_ok = GatewayConfig.from_dict(data_ok)
+                connected = cfg_ok.get_connected_platforms()
+            assert "tphookresolved" in {p.value for p in connected}
+            assert seen["token"] == "real-tok", (
+                "validate_config must see resolved env value, not the "
+                "literal ${VAR}"
+            )
+
+            # Env unset → resolves to "" → validator rejects
+            os.environ.pop("HOOK_RESOLVED_UNSET", None)
+            seen.clear()
+            data_unset = {
+                "platforms": {
+                    "tphookresolved": {
+                        "enabled": True,
+                        "extra": {"token": "${HOOK_RESOLVED_UNSET}"},
+                    },
+                }
+            }
+            cfg_unset = GatewayConfig.from_dict(data_unset)
+            connected = cfg_unset.get_connected_platforms()
+            assert "tphookresolved" not in {p.value for p in connected}
+            assert seen["token"] == ""
+        finally:
+            _reg.unregister("tphookresolved")
 
 
 # ── Extended PlatformEntry fields ─────────────────────────────────────

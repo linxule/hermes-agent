@@ -26,13 +26,144 @@ Usage (plugin side):
 Usage (gateway side):
 
     adapter = platform_registry.create_adapter("irc", platform_config)
+
+``create_adapter`` also resolves ``${VAR}`` literals in
+``PlatformConfig.token``, ``PlatformConfig.api_key``, and string values
+inside ``PlatformConfig.extra`` against ``os.environ`` before invoking
+the factory.  This gives external plugins parity with built-in platforms
+whose tokens are resolved by ``gateway/config.py::_apply_env_overrides``.
+See :func:`_resolve_env_template`.
 """
 
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Matches a whole-field docker-compose-style env template, e.g. "${MY_TOKEN}".
+# Allows surrounding whitespace; env var names follow POSIX shell rules.
+_ENV_TEMPLATE_RE = re.compile(r"^\s*\$\{([A-Za-z_][A-Za-z0-9_]*)\}\s*$")
+
+
+def _resolve_env_template(value: Any) -> Any:
+    """Resolve a docker-compose-style ``${VAR}`` literal via :func:`os.getenv`.
+
+    Used internally by :py:meth:`PlatformRegistry.create_adapter` to give
+    external-plugin adapters parity with built-in platforms whose tokens get
+    resolved by ``gateway/config.py::_apply_env_overrides``.
+
+    Behavior:
+
+    - ``"${MY_TOKEN}"`` with ``MY_TOKEN=abc`` in the environment → ``"abc"``
+    - ``"${MY_TOKEN}"`` with no such env var → ``""`` (caller can fall back)
+    - ``"plain-string"`` → ``"plain-string"`` (no match, returned unchanged)
+    - ``"prefix-${VAR}"`` → unchanged (only whole-field templates are resolved;
+      partial-substring substitution is intentionally NOT supported to keep
+      the contract simple)
+    - ``None`` / non-string → returned unchanged
+    - Already-resolved values → returned unchanged
+
+    The helper is **idempotent against itself**: calling it twice in a row
+    on the same value yields the same result, because resolved values don't
+    match the ``${VAR}`` shape.  It does not promise idempotence against
+    arbitrary future substitution chains.
+
+    Deliberately rejected patterns (kept as literals):
+
+    - ``$VAR`` (no braces) — too easy to confuse with regular strings
+    - ``${MY-VAR}`` (hyphen) — not POSIX
+    - ``${MY_VAR:-default}`` (bash defaults) — would require a tokenizer
+    - ``"${A}${B}"`` (concatenation) — not in scope; whole-field only
+    - ``"prefix-${VAR}-suffix"`` (partial substitution) — same reason
+    - ``${!VAR}`` (shell-style indirect expansion) — not supported
+
+    For non-trivial substitution (defaults, concatenation, nested), plugins
+    should implement their own resolution via the ``apply_yaml_config_fn``
+    hook at YAML load time rather than relying on this helper.
+    """
+    if not isinstance(value, str):
+        return value
+    match = _ENV_TEMPLATE_RE.match(value)
+    if not match:
+        return value
+    return os.getenv(match.group(1), "")
+
+
+def apply_env_template_substitutions(
+    config: Any,
+    *,
+    label: Optional[str] = None,
+) -> Any:
+    """Resolve ``${VAR}`` literals in a ``PlatformConfig`` in place.
+
+    Walks ``config.token``, ``config.api_key``, and string values inside
+    ``config.extra``, replacing whole-field ``${VAR}`` templates with
+    ``os.getenv(VAR, "")``.  Non-strings, ``None``, missing attributes,
+    and non-dict ``extra`` are skipped safely.  Returns the same ``config``
+    object (mutated) for chaining.
+
+    Emits a WARNING when a template resolves to an empty string (env var
+    unset) so silent misconfigurations stay loud.  *label* is the platform
+    name/label used in the log message; falls back to ``"platform"``.
+
+    Called from two places to keep them in sync:
+
+    1. :py:meth:`PlatformRegistry.create_adapter` — resolves before the
+       adapter factory sees the config (and before ``validate_config``).
+    2. :py:meth:`gateway.config.GatewayConfig._is_platform_connected` for
+       plugin-registered platforms — resolves before the generic
+       ``token``/``api_key`` truthy check and before plugin ``is_connected``
+       / ``validate_config`` callbacks see the config.  Without this,
+       ``get_connected_platforms()`` and adapter construction can disagree
+       on the same config (the literal ``"${UNSET}"`` is truthy in the
+       former, empty in the latter).
+
+    Built-in platforms reach their tokens via ``gateway/config.py::
+    _apply_env_overrides`` at YAML load time, which already populates the
+    field with the resolved env value, so calling this helper on a
+    built-in is a no-op against any deployment that isn't itself using
+    docker-compose-style templates in a built-in YAML config.
+
+    Hot-reload note: this helper mutates ``config`` in place, which is
+    irreversible for the lifetime of the ``GatewayConfig``.  If the
+    referenced env var changes between gateway startup and a hot reload,
+    the originally-resolved value sticks.  This matches the existing
+    behavior of ``_apply_env_overrides`` for built-in platforms (env
+    vars are read once at YAML load), so external plugins using this
+    helper get the same semantics as built-ins — neither stricter nor
+    weaker.
+    """
+    log_label = label or "platform"
+    for attr in ("token", "api_key"):
+        current = getattr(config, attr, None)
+        resolved = _resolve_env_template(current)
+        if resolved != current:
+            setattr(config, attr, resolved)
+            if isinstance(current, str) and resolved == "":
+                logger.warning(
+                    "Platform '%s': env var referenced by %s=%r is unset "
+                    "or empty; resolved to empty string",
+                    log_label, attr, current,
+                )
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, dict):
+        for key, value in list(extra.items()):
+            if not isinstance(value, str):
+                continue
+            resolved = _resolve_env_template(value)
+            if resolved != value:
+                extra[key] = resolved
+                if resolved == "":
+                    logger.warning(
+                        "Platform '%s': env var referenced by extra[%r]=%r "
+                        "is unset or empty; resolved to empty string",
+                        log_label, key, value,
+                    )
+    return config
 
 
 @dataclass
@@ -209,10 +340,23 @@ class PlatformRegistry:
         """Create an adapter instance for the given platform name.
 
         Returns None if:
+
         - No entry registered for *name*
-        - check_fn() returns False (missing deps)
-        - validate_config() returns False (misconfigured)
-        - The factory raises an exception
+        - ``check_fn()`` returns False (missing deps) — no mutation occurs
+        - ``validate_config()`` returns False (misconfigured) — substitution
+          has already mutated ``config``
+        - The factory raises an exception — substitution has already mutated
+          ``config``
+
+        **Mutates ``config`` in place.**  After ``check_fn`` passes, the
+        registry resolves ``${VAR}`` literals in ``config.token``,
+        ``config.api_key``, and string values inside ``config.extra`` via
+        :func:`os.getenv`.  This runs **before** ``validate_config`` so
+        plugin authors who write ``validate_config = lambda c: bool(c.token)``
+        see the resolved value, not the literal.
+
+        Idempotent: non-template values pass through unchanged, and a
+        repeated call on an already-substituted ``config`` is a no-op.
         """
         entry = self._entries.get(name)
         if entry is None:
@@ -226,6 +370,15 @@ class PlatformRegistry:
                 hint,
             )
             return None
+
+        # Resolve "${VAR}" literals before validate_config and the factory
+        # see them.  Same helper is also called by
+        # gateway.config.GatewayConfig._is_platform_connected so plugin
+        # is_connected / validate_config callbacks see resolved values
+        # whether they run at YAML load time or at adapter construction.
+        # See: website/docs/developer-guide/adding-platform-adapters.md
+        # § "Configuration values are passed raw".
+        apply_env_template_substitutions(config, label=entry.label)
 
         if entry.validate_config is not None:
             try:
