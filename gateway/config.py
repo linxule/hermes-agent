@@ -498,6 +498,25 @@ class GatewayConfig:
 
     def _is_platform_connected(self, platform: Platform, config: PlatformConfig) -> bool:
         """Check whether a single platform is sufficiently configured."""
+        # For plugin-registered platforms, resolve ``${VAR}`` literals in
+        # ``token`` / ``api_key`` / ``extra`` before any check sees them.
+        # Without this, the generic ``token or api_key`` branch below
+        # accepts the truthy literal ``"${UNSET}"`` from a misconfigured
+        # plugin and reports the platform as connected, while a later
+        # ``PlatformRegistry.create_adapter`` call would resolve it to
+        # ``""`` and refuse to construct the adapter.  Mutates ``config``
+        # in place; idempotent against built-in platforms whose tokens are
+        # already resolved by :func:`_apply_env_overrides`.
+        try:
+            from gateway.platform_registry import (
+                platform_registry,
+                apply_env_template_substitutions,
+            )
+            if platform_registry.is_registered(platform.value):
+                apply_env_template_substitutions(config, label=platform.value)
+        except Exception:
+            pass  # Registry not yet initialised during early import
+
         # Weixin requires both a token and an account_id (checked first so
         # the generic token branch doesn't let it through without account_id).
         if platform == Platform.WEIXIN:
