@@ -637,6 +637,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'integrations/index',
         'integrations/providers',
+        'integrations/external-platform-plugins',
         'user-guide/features/mcp',
         'user-guide/features/acp',
         'user-guide/features/api-server',

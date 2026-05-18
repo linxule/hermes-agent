@@ -456,6 +456,8 @@ See `plugins/platforms/line/adapter.py` for the full LINE postback implementatio
 
 See `plugins/platforms/irc/` in the repo for a complete working example — a full async IRC adapter with zero external dependencies. `plugins/platforms/teams/` covers Bot Framework / Adaptive Cards, `plugins/platforms/google_chat/` covers OAuth-based REST APIs, and `plugins/platforms/line/` covers webhook-driven Messaging APIs with platform-specific slow-LLM UX.
 
+For community-maintained external plugins that exercise the same `ctx.register_platform()` contract, see [External Platform Plugins](/docs/integrations/external-platform-plugins) — a discovery-only list of known third-party platform plugins.
+
 ---
 
 ## Step-by-Step Checklist (Built-in Path)
